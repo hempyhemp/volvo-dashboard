@@ -1,57 +1,59 @@
 #include "ui_demo.h"
 #include "lvgl.h"
-#include "fonts/font_cyrillic_16.h"
+#include "screen_debug.h"
+#include "screen_online.h"
 
 // Этот файл не знает, где именно он рисуется — на SDL-окне в PC-симуляторе
 // или на реальном TFT_eSPI/ILI9341 через LVGL. Поэтому здесь нет ничего
 // специфичного для железа (GPIO, SPI и т.п.) — только LVGL-виджеты.
+//
+// Здесь только переключение вкладок; содержимое каждой вкладки — в
+// screen_debug.c (техническая проверка) и screen_online.c (приборка).
 
-static lv_obj_t *uptime_label;
+// Тёмная тема для панели вкладок: по умолчанию LVGL рисует её светлой,
+// что не подходит для приборки. Красим саму панель и каждую кнопку
+// вручную (у lv_tabview кнопки — обычные lv_button, отдельного API для
+// их темы нет).
+static void style_tab_bar_dark(lv_obj_t *tv) {
+  lv_obj_t *tab_bar = lv_tabview_get_tab_bar(tv);
+
+  lv_obj_set_style_bg_color(tab_bar, lv_color_hex(0x121218), 0);
+  lv_obj_set_style_bg_opa(tab_bar, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(tab_bar, 0, 0);
+
+  uint32_t btn_count = lv_obj_get_child_count(tab_bar);
+  for (uint32_t i = 0; i < btn_count; i++) {
+    lv_obj_t *btn = lv_obj_get_child(tab_bar, i);
+
+    lv_obj_set_style_radius(btn, 0, 0);
+    lv_obj_set_style_border_width(btn, 0, 0);
+    lv_obj_set_style_shadow_width(btn, 0, 0);
+    lv_obj_set_style_outline_width(btn, 0, 0);
+
+    lv_obj_set_style_bg_color(btn, lv_color_hex(0x1C1C24), 0);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+    lv_obj_set_style_text_color(btn, lv_color_hex(0x8C8C97), 0);
+
+    // Активная вкладка — акцентный цвет вместо стандартного светлого.
+    lv_obj_set_style_bg_color(btn, lv_color_hex(0x2C6BFF), LV_STATE_CHECKED);
+    lv_obj_set_style_text_color(btn, lv_color_white(), LV_STATE_CHECKED);
+  }
+}
 
 void ui_demo_create(void) {
-  lv_obj_t *scr = lv_screen_active();
-  lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
-  lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+  lv_obj_t *tv = lv_tabview_create(lv_screen_active());
+  lv_tabview_set_tab_bar_position(tv, LV_DIR_TOP);
+  lv_tabview_set_tab_bar_size(tv, 32);
 
-  lv_obj_t *frame = lv_obj_create(scr);
-  lv_obj_remove_style_all(frame);
-  lv_obj_set_size(frame, lv_pct(100), lv_pct(100));
-  lv_obj_set_style_border_width(frame, 2, 0);
-  lv_obj_set_style_border_color(frame, lv_color_white(), 0);
-  lv_obj_center(frame);
+  lv_obj_t *tab_debug = lv_tabview_add_tab(tv, "DEBUG");
+  lv_obj_t *tab_online = lv_tabview_add_tab(tv, "ONLINE");
 
-  lv_obj_t *title = lv_label_create(scr);
-  lv_label_set_text(title, "ESP32-2432S028");
-  lv_obj_set_style_text_color(title, lv_color_hex(0x00FF00), 0);
-  lv_obj_align(title, LV_ALIGN_TOP_LEFT, 20, 20);
+  style_tab_bar_dark(tv);
 
-  lv_obj_t *hello = lv_label_create(scr);
-  lv_label_set_text(hello, "HELLO");
-  lv_obj_set_style_text_color(hello, lv_color_hex(0xFFFF00), 0);
-  lv_obj_align(hello, LV_ALIGN_TOP_LEFT, 20, 60);
-
-  // Кириллица — обычные встроенные шрифты LVGL (Montserrat и т.п.) её не
-  // содержат, поэтому явно задаём кастомный шрифт (lib/ui_demo/fonts/).
-  lv_obj_t *name = lv_label_create(scr);
-  lv_label_set_text(name, "Сашааа");
-  lv_obj_set_style_text_color(name, lv_color_hex(0xFFFF00), 0);
-  lv_obj_set_style_text_font(name, &font_cyrillic_16, 0);
-  lv_obj_align(name, LV_ALIGN_TOP_LEFT, 20, 95);
-
-  lv_obj_t *ok = lv_label_create(scr);
-  lv_label_set_text(ok, "DISPLAY OK");
-  lv_obj_set_style_text_color(ok, lv_color_hex(0x00FFFF), 0);
-  lv_obj_align(ok, LV_ALIGN_TOP_LEFT, 20, 135);
-
-  uptime_label = lv_label_create(scr);
-  lv_label_set_text(uptime_label, "Uptime: 0 s");
-  lv_obj_set_style_text_color(uptime_label, lv_color_white(), 0);
-  lv_obj_align(uptime_label, LV_ALIGN_TOP_LEFT, 20, 175);
+  screen_debug_create(tab_debug);
+  screen_online_create(tab_online);
 }
 
 void ui_demo_update_uptime(uint32_t seconds) {
-  if (uptime_label == NULL) {
-    return;
-  }
-  lv_label_set_text_fmt(uptime_label, "Uptime: %lu s", (unsigned long)seconds);
+  screen_debug_update_uptime(seconds);
 }

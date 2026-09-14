@@ -25,7 +25,10 @@ target_link_libraries(lvgl PUBLIC SDL2::SDL2)
 add_executable(sim
     src/main.c
     ../lib/ui_demo/ui_demo.c
+    ../lib/ui_demo/screen_debug.c
+    ../lib/ui_demo/screen_online.c
     ../lib/ui_demo/fonts/font_cyrillic_16.c
+    ../lib/ui_demo/images/img_cat_bg.c
 )
 
 target_include_directories(sim PRIVATE ../lib/ui_demo)

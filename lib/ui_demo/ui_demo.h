@@ -11,11 +11,10 @@
 extern "C" {
 #endif
 
-// Создаёт тестовый экран (тот же, что должен появиться на реальном
-// дисплее ESP32-2432S028 после переезда прошивки на LVGL).
+// Создаёт интерфейс: сверху переключатель вкладок DEBUG / ONLINE.
 void ui_demo_create(void);
 
-// Обновляет строку "Uptime: N s" на экране.
+// Обновляет строку "Uptime: N s" на вкладке DEBUG.
 void ui_demo_update_uptime(uint32_t seconds);
 
 #ifdef __cplusplus

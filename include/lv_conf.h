@@ -69,9 +69,10 @@
 
 #if LV_USE_STDLIB_MALLOC == LV_STDLIB_BUILTIN
     /** Size of memory available for `lv_malloc()` in bytes (>= 2kB) */
-    // Уменьшено с дефолтных 64 КБ — у ESP32 всего 320 КБ DRAM, а наш
-    // интерфейс пока состоит из нескольких надписей и рамки.
-    #define LV_MEM_SIZE (24 * 1024U)          /**< [bytes] */
+    // Увеличено с изначальных 24 КБ: вкладка ONLINE добавила 8 дуг +
+    // подписи + lv_tabview — свободного DRAM пока много (~33% занято
+    // из 320 КБ), так что берём с запасом.
+    #define LV_MEM_SIZE (48 * 1024U)          /**< [bytes] */
 
     /** Size of the memory expand for `lv_malloc()` in bytes */
     #define LV_MEM_POOL_EXPAND_SIZE 0
