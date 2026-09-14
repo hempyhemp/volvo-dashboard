@@ -1,0 +1,15 @@
+# PlatformIO (ESP32-прошивка)
+.pio/
+.vscode/
+*.bak
+
+# PC-симулятор (pc-sim) — всё это тяжёлое и легко восстанавливается
+# по инструкциям в pc-sim/README.md (git clone lvgl, bootstrap vcpkg)
+pc-sim/build/
+pc-sim/lib/lvgl/
+pc-sim/tools/vcpkg/
+pc-sim/vcpkg_installed/
+
+# Временные логи, которые иногда создаются при отладке сборки
+*_log.txt
+build_log.txt

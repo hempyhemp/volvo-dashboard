@@ -1,0 +1,8 @@
+{
+  "name": "cyd-dashboard-sim",
+  "version": "0.1.0",
+  "dependencies": [
+    "sdl2"
+  ],
+  "builtin-baseline": "ff0a89211d0e0cf19ba70f939f10dd7f8c4184fa"
+}
