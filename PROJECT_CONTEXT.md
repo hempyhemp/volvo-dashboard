@@ -10,8 +10,11 @@ Hardware:
 * Display controller: ILI9341-клон, требует ILI9341_2_DRIVER в TFT_eSPI (см. platformio.ini)
 * Display interface: SPI
 * Touch: XPT2046, резистивный, SPI — подключён и используется (LVGL
-  pointer indev, `setupTouch()` в `src/main.cpp`; калибровка сохраняется
-  в NVS через `Preferences`, см. docs/HARDWARE.md)
+  pointer indev, `setupTouch()` в `src/main.cpp`)
+* K-Line: донорская плата на LM339, подключена через разъём **CN1**
+  (GND-22-27-3V3) — единственный разъём платы с двумя свободными GPIO
+  одновременно (GPIO22=TX, GPIO27=RX). Подробности — `docs/HARDWARE.md`
+  (таблица разъёмов) и `docs/KLINE.md` (протокол, статус параметров).
 
 UI development:
 * Экран полностью на LVGL (v9.5.0) — и в прошивке ESP32, и в PC-симуляторе
@@ -21,30 +24,30 @@ UI development:
   локальных библиотек; `pc-sim/CMakeLists.txt` ссылается на те же файлы
   по относительному пути `../lib/ui_demo/`). Одна копия кода, используется
   и платой, и симулятором
-* Структура: `ui_demo.c` — переключатель вкладок (lv_tabview, тёмная тема);
-  `screen_debug.c` — техническая проверка (кириллица, аптайм);
-  `screen_online.c` — черновик приборки (моковые данные, дуги/цифры,
-  фон-фото `lib/ui_demo/images/img_cat_bg.c`, сгенерировано из
-  `assets/fon.jpg`)
+* Структура:
+  - `ui_demo.c` — переключатель вкладок (lv_tabview, тёмная тема)
+  - `screen_debug.c` — статус K-Line + плитки живых данных
+    (RPM/темп/дроссель/напряжение), читает `kline_data.h` напрямую
+  - `screen_online.c` — черновик приборки (фон — тёмный градиент; фон-фото
+    котика закомментирован, но остался в коде на будущее). RPM/COOLANT/
+    VOLT берутся из реальных K-Line данных, когда ЭБУ подключён; остальные
+    параметры пока мок (см. `docs/KLINE.md`)
+  - `kline_data.h`/`.c` — общий hardware-agnostic слой живых данных ЭБУ
+    (не зависит от Arduino, общий для платы и симулятора)
 * Кириллица под LVGL — через кастомный шрифт `lib/ui_demo/fonts/`,
   сгенерирован `npx lv_font_conv` из Segoe UI (встроенные шрифты LVGL
   кириллицу не содержат)
+* K-Line/ЭБУ (ESP32-only, НЕ компилируется в pc-sim) — `src/kline_test.cpp`/`.h`:
+  автоподключение (KWP2000, fast init), непрерывный опрос, RAW-анализ для
+  поиска новых параметров. См. `docs/KLINE.md`.
 
 Project purpose:
-Автомобильная приборная панель на ESP32.
-
-Future stages:
-
-1. ESP32 firmware
-2. TFT display
-3. UI приборной панели
-4. K-Line interface
-5. Январь 5.1 ECU communication
-6. Reading ECU parameters
-7. Displaying automotive data
+Автомобильная приборная панель на ESP32, читающая данные с ЭБУ **Январь
+5.1.61** по K-Line.
 
 Current stage:
-LVGL-интерфейс с тач-управлением на плате и в PC-симуляторе. Вкладка
-ONLINE — черновик приборки с моковыми данными (K-Line ещё не подключён).
-
-Do NOT implement K-Line yet.
+K-Line подключён и работает (KWP2000, "быстрая инициализация"). RPM,
+температура ОЖ, положение дросселя, напряжение борт. сети — подтверждены
+и используются. Идёт reverse engineering остальных параметров (в первую
+очередь MAP/абсолютное давление и ДТВ/температура воздуха) — см.
+`docs/KLINE.md` (там же шпаргалка со статусом каждого параметра).

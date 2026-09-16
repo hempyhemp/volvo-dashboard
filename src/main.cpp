@@ -84,16 +84,18 @@ void lvgl_touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
     int x = constrain(map(p.x, TOUCH_RAW_X_MIN, TOUCH_RAW_X_MAX, 0, tft.width()), 0, tft.width() - 1);
     int y = constrain(map(p.y, TOUCH_RAW_Y_MIN, TOUCH_RAW_Y_MAX, 0, tft.height()), 0, tft.height() - 1);
 
-    Serial.print("touch raw: x=");
-    Serial.print(p.x);
-    Serial.print(" y=");
-    Serial.print(p.y);
-    Serial.print(" z=");
-    Serial.print(p.z);
-    Serial.print("  -> screen: x=");
-    Serial.print(x);
-    Serial.print(" y=");
-    Serial.println(y);
+    // Закомментировано на время reverse-engineering K-Line (см.
+    // docs/KLINE.md) — не мешаем Serial Monitor лишним выводом.
+    // Serial.print("touch raw: x=");
+    // Serial.print(p.x);
+    // Serial.print(" y=");
+    // Serial.print(p.y);
+    // Serial.print(" z=");
+    // Serial.print(p.z);
+    // Serial.print("  -> screen: x=");
+    // Serial.print(x);
+    // Serial.print(" y=");
+    // Serial.println(y);
 
     data->state = LV_INDEV_STATE_PRESSED;
     data->point.x = x;
@@ -104,33 +106,37 @@ void lvgl_touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
 }
 
 void printChipInfo() {
-  Serial.println("------------------------------");
-  Serial.println("Chip info:");
-  Serial.print("  Model: ");
-  Serial.println(ESP.getChipModel());
-  Serial.print("  Revision: ");
-  Serial.println(ESP.getChipRevision());
-  Serial.print("  Cores: ");
-  Serial.println(ESP.getChipCores());
-  Serial.print("  CPU Freq (MHz): ");
-  Serial.println(ESP.getCpuFreqMHz());
-  Serial.print("  Flash size (bytes): ");
-  Serial.println(ESP.getFlashChipSize());
-  Serial.print("  Free heap (bytes): ");
-  Serial.println(ESP.getFreeHeap());
-  Serial.println("------------------------------");
+  // Закомментировано на время reverse-engineering K-Line (см.
+  // docs/KLINE.md) — не мешаем Serial Monitor лишним выводом.
+  // Serial.println("------------------------------");
+  // Serial.println("Chip info:");
+  // Serial.print("  Model: ");
+  // Serial.println(ESP.getChipModel());
+  // Serial.print("  Revision: ");
+  // Serial.println(ESP.getChipRevision());
+  // Serial.print("  Cores: ");
+  // Serial.println(ESP.getChipCores());
+  // Serial.print("  CPU Freq (MHz): ");
+  // Serial.println(ESP.getCpuFreqMHz());
+  // Serial.print("  Flash size (bytes): ");
+  // Serial.println(ESP.getFlashChipSize());
+  // Serial.print("  Free heap (bytes): ");
+  // Serial.println(ESP.getFreeHeap());
+  // Serial.println("------------------------------");
 }
 
 void setup() {
   Serial.begin(115200);
   delay(1500);
 
-  Serial.println("========================");
-  Serial.println("ESP32-2432S028 TEST");
-  Serial.println("========================");
-  Serial.println("ESP32 STARTED");
+  // Закомментировано на время reverse-engineering K-Line (см.
+  // docs/KLINE.md) — не мешаем Serial Monitor лишним выводом.
+  // Serial.println("========================");
+  // Serial.println("ESP32-2432S028 TEST");
+  // Serial.println("========================");
+  // Serial.println("ESP32 STARTED");
 
-  printChipInfo();
+  // printChipInfo();
 
   // Подсветку включаем явно, отдельным пином (TFT_BL = GPIO21).
   pinMode(TFT_BL, OUTPUT);
@@ -143,14 +149,14 @@ void setup() {
   // цвета часто инвертированы: чёрный фон рисуется белым. Включаем инверсию.
   tft.invertDisplay(true);
 
-  Serial.println("DISPLAY INITIALIZED");
-  Serial.print("  tft.width()  = ");
-  Serial.println(tft.width());
-  Serial.print("  tft.height() = ");
-  Serial.println(tft.height());
+  // Serial.println("DISPLAY INITIALIZED");
+  // Serial.print("  tft.width()  = ");
+  // Serial.println(tft.width());
+  // Serial.print("  tft.height() = ");
+  // Serial.println(tft.height());
 
   setupTouch();
-  Serial.println("TOUCH INITIALIZED");
+  // Serial.println("TOUCH INITIALIZED");
 
   // --- Инициализация LVGL ---
   lv_init();
@@ -167,8 +173,8 @@ void setup() {
   ui_demo_create();
   kline_test_register();
 
-  Serial.println("DISPLAY TEST OK");
-  Serial.println("========================");
+  // Serial.println("DISPLAY TEST OK");
+  // Serial.println("========================");
 }
 
 void loop() {
@@ -187,6 +193,6 @@ void loop() {
 
   if (now - lastBeat >= 3000) {
     lastBeat = now;
-    Serial.println("...alive...");
+    // Serial.println("...alive...");
   }
 }

@@ -39,6 +39,20 @@
 //   Остальные параметры (давление, топливо и т.д.) пока не проверены на
 //   этом ЭБУ и не парсятся.
 //
+// RAW-АНАЛИЗ ДЛЯ ПОИСКА НОВЫХ ПАРАМЕТРОВ (напр. MAP из TRS251):
+//   kline_analyze_raw() хранит предыдущий ответ readData и на каждом
+//   следующем сравнивает побайтово. Если что-то изменилось — печатает в
+//   Serial полный RAW-дамп (с индексами) и отдельно список изменившихся
+//   байт (индекс, было -> стало). Если ничего не изменилось — молчит
+//   (иначе Serial захлебнётся при опросе раз в 300мс). Метод: меняем на
+//   ЭБУ физически ОДИН параметр (например, давление на ДАД) и смотрим,
+//   какой байт(ы) дрогнули — так же, как автор поста про Январь 7.2/
+//   Bosch 7.9.7 подбирал байты для Bosch вручную, только тут вместо
+//   осциллографа сравнение самих HEX-пакетов. Это временный
+//   инструмент для reverse engineering — не часть готовой раскладки
+//   параметров, найденные байты потом переносятся в kline_parse_read_data
+//   и kline_data_t как обычные поля.
+//
 // АВТОПОДКЛЮЧЕНИЕ (без кнопки):
 //   Раньше подключение запускалось только по кнопке. Идея проверять
 //   готовность ЭБУ по уровню на RX (например, "idle=HIGH значит ЭБУ
@@ -57,6 +71,7 @@
 
 #include <Arduino.h>
 #include <lvgl.h>
+#include <string.h>
 #include "kline_test.h"
 #include "screen_debug.h"
 #include "kline_data.h"
@@ -110,8 +125,10 @@ static bool kline_self_echo_test(void) {
   KlineSerial.flush();
   uint8_t got = 0;
   bool ok = kline_read_byte(&got, 60);
-  Serial.printf("  self-echo: %s (получено 0x%02X)\n",
-                ok ? "ЕСТЬ эхо" : "нет эха", got);
+  // Закомментировано на время reverse-engineering K-Line (см.
+  // docs/KLINE.md) — не мешаем Serial Monitor лишним выводом.
+  // Serial.printf("  self-echo: %s (получено 0x%02X)\n",
+  //               ok ? "ЕСТЬ эхо" : "нет эха", got);
   return ok;
 }
 
@@ -134,22 +151,101 @@ static size_t kline_send_and_collect(const uint8_t *cmd, size_t len,
   return n;
 }
 
-static void kline_dump_hex(const char *label, const uint8_t *buf, size_t n) {
-  Serial.print(label);
-  Serial.print(" (");
-  Serial.print(n);
-  Serial.print(" байт): ");
-  for (size_t i = 0; i < n; i++) {
-    Serial.printf("%02X ", buf[i]);
-  }
-  Serial.println();
-}
+// Закомментировано на время reverse-engineering K-Line (см. docs/KLINE.md)
+// — не мешаем Serial Monitor лишним выводом, оставлен только RAW-анализ
+// (kline_analyze_raw ниже).
+// static void kline_dump_hex(const char *label, const uint8_t *buf, size_t n) {
+//   Serial.print(label);
+//   Serial.print(" (");
+//   Serial.print(n);
+//   Serial.print(" байт): ");
+//   for (size_t i = 0; i < n; i++) {
+//     Serial.printf("%02X ", buf[i]);
+//   }
+//   Serial.println();
+// }
 
 static bool kline_contains(const uint8_t *buf, size_t n, uint8_t value) {
   for (size_t i = 0; i < n; i++) {
     if (buf[i] == value) return true;
   }
   return false;
+}
+
+// Байты с уже известным смыслом — скрываем их из CHANGED, чтобы лог не
+// засорялся их обычным дрожанием/сменой при движке офф. Индексы — в
+// той же нумерации, что и весь остальной файл (от начала ПОЛНОГО
+// буфера, эхо запроса включено):
+//   0-9   — эхо нашего же запроса (81 10 F1 21 01 A5), константа
+//   10-11 — SID (0x61) + LID (0x01) эхо, тоже константа при успехе
+//   20    — coolant, 22 — throttle, 23 — rpm, 29 — speed, 30 — voltage
+//     (уже расшифрованы и используются в kline_parse_read_data)
+//   38-39 — часовой расход топлива (л/ч), 40-41 — путевой расход
+//     топлива (л/100км) — известны из поста про Январь 7.2 (buffer[38..41]
+//     в исходном коде), просто пока не добавлены в kline_data_t
+//   46    — контрольная сумма, чисто производная от остальных байт
+static bool kline_is_known_byte(size_t idx) {
+  static const size_t known[] = {0,  1,  2,  3,  4,  5,  6,  7,  8, 9,
+                                  10, 11, 20, 22, 23, 29, 30, 38, 39, 40,
+                                  41, 46};
+  for (size_t i = 0; i < sizeof(known) / sizeof(known[0]); i++) {
+    if (known[i] == idx) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// См. комментарий "RAW-АНАЛИЗ" в шапке файла. Хранит предыдущий readData
+// и печатает в Serial только то, что изменилось с прошлого раза, помимо
+// уже известных байт (kline_is_known_byte) — молчит, если поменялись
+// только они, или если пакет вообще идентичен предыдущему.
+static uint8_t g_prev_resp[64];
+static size_t g_prev_resp_len = 0;
+static bool g_have_prev_resp = false;
+
+static void kline_analyze_raw(const uint8_t *resp, size_t n) {
+  if (n == 0) {
+    return;
+  }
+
+  bool changed = (n != g_prev_resp_len);
+  if (!changed) {
+    for (size_t i = 0; i < n; i++) {
+      if (resp[i] != g_prev_resp[i] && !kline_is_known_byte(i)) {
+        changed = true;
+        break;
+      }
+    }
+  }
+
+  if (g_have_prev_resp && changed) {
+    Serial.println("K-Line RAW: пакет изменился относительно предыдущего");
+    Serial.print("RAW:");
+    for (size_t i = 0; i < n; i++) {
+      Serial.printf(" [%u]%02X", (unsigned)i, resp[i]);
+    }
+    Serial.println();
+
+    Serial.println("CHANGED (известные байты скрыты):");
+    size_t common = (n < g_prev_resp_len) ? n : g_prev_resp_len;
+    for (size_t i = 0; i < common; i++) {
+      if (resp[i] != g_prev_resp[i] && !kline_is_known_byte(i)) {
+        Serial.printf("  [%u] %02X -> %02X\n", (unsigned)i, g_prev_resp[i],
+                      resp[i]);
+      }
+    }
+    for (size_t i = common; i < n; i++) {
+      if (!kline_is_known_byte(i)) {
+        Serial.printf("  [%u] (новый байт) -> %02X\n", (unsigned)i, resp[i]);
+      }
+    }
+    Serial.println();
+  }
+
+  memcpy(g_prev_resp, resp, n);
+  g_prev_resp_len = n;
+  g_have_prev_resp = true;
 }
 
 // Разбирает ответ на readData по смещениям, подтверждённым на реальном
@@ -185,7 +281,8 @@ static bool kline_try_connect(void) {
 
   size_t n2 = kline_send_and_collect(kReadData, sizeof(kReadData), 150, resp,
                                       sizeof(resp));
-  kline_dump_hex("K-Line: подключились, ответ на readData", resp, n2);
+  // kline_dump_hex("K-Line: подключились, ответ на readData", resp, n2);
+  kline_analyze_raw(resp, n2);
 
   kline_data_t kd = {0};
   if (!kline_parse_read_data(resp, n2, &kd)) {
@@ -204,7 +301,7 @@ static void kline_manual_test(void) {
 
   kline_ensure_serial_started();
 
-  Serial.println("K-Line: ручной тест — self-echo");
+  // Serial.println("K-Line: ручной тест — self-echo");
   if (!kline_self_echo_test()) {
     screen_debug_set_kline_result("K-Line: эха нет - проверь пайку/GND",
                                    false);
@@ -255,6 +352,7 @@ void kline_test_poll(uint32_t now_ms) {
   uint8_t resp[64];
   size_t n = kline_send_and_collect(kReadData, sizeof(kReadData), 150, resp,
                                      sizeof(resp));
+  kline_analyze_raw(resp, n);
 
   kline_data_t kd = {0};
   if (!kline_parse_read_data(resp, n, &kd)) {

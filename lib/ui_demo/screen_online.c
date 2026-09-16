@@ -171,22 +171,26 @@ static void make_label(param_t *p, lv_obj_t *parent, const char *name,
 
 void screen_online_create(lv_obj_t *parent) {
   lv_obj_set_style_pad_all(parent, 0, 0);
-  lv_obj_set_style_bg_opa(parent, LV_OPA_TRANSP, 0);
 
-  // Фон — фото котика (assets/fon.jpg -> lib/ui_demo/images/img_cat_bg.*,
-  // сгенерировано скриптом-конвертером в RGB565). Поверх — полупрозрачная
-  // тёмная плашка, чтобы цифры было видно на любом фото.
-  lv_obj_t *bg_img = lv_image_create(parent);
-  lv_image_set_src(bg_img, &img_cat_bg);
-  lv_obj_set_pos(bg_img, 0, 0);
+  // Фон — фото котика, временно закомментировано, вернули градиент (см.
+  // ниже). Раскомментировать, когда снова понадобится:
+  // lv_obj_t *bg_img = lv_image_create(parent);
+  // lv_image_set_src(bg_img, &img_cat_bg);
+  // lv_obj_set_pos(bg_img, 0, 0);
+  //
+  // lv_obj_t *overlay = lv_obj_create(parent);
+  // lv_obj_remove_style_all(overlay);
+  // lv_obj_remove_flag(overlay, LV_OBJ_FLAG_CLICKABLE);
+  // lv_obj_set_size(overlay, lv_pct(100), lv_pct(100));
+  // lv_obj_set_pos(overlay, 0, 0);
+  // lv_obj_set_style_bg_color(overlay, lv_color_black(), 0);
+  // lv_obj_set_style_bg_opa(overlay, 110, 0); // ~43% затемнение
 
-  lv_obj_t *overlay = lv_obj_create(parent);
-  lv_obj_remove_style_all(overlay);
-  lv_obj_remove_flag(overlay, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_set_size(overlay, lv_pct(100), lv_pct(100));
-  lv_obj_set_pos(overlay, 0, 0);
-  lv_obj_set_style_bg_color(overlay, lv_color_black(), 0);
-  lv_obj_set_style_bg_opa(overlay, 110, 0); // ~43% затемнение
+  // Фон — тёмный вертикальный градиент (тот, что был до фото котика).
+  lv_obj_set_style_bg_opa(parent, LV_OPA_COVER, 0);
+  lv_obj_set_style_bg_color(parent, lv_color_hex(0x14141C), 0);
+  lv_obj_set_style_bg_grad_color(parent, lv_color_hex(0x000000), 0);
+  lv_obj_set_style_bg_grad_dir(parent, LV_GRAD_DIR_VER, 0);
 
   srand((unsigned int)lv_tick_get());
 
