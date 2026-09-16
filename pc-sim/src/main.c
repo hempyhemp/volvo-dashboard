@@ -27,8 +27,6 @@ int main(void) {
     lv_tick_inc(now - last_tick);
     last_tick = now;
 
-    ui_demo_update_uptime(now / 1000);
-
     uint32_t idle_ms = lv_timer_handler();
     SDL_Delay(idle_ms < 5 ? 5 : idle_ms);
   }

@@ -53,7 +53,3 @@ void ui_demo_create(void) {
   screen_debug_create(tab_debug);
   screen_online_create(tab_online);
 }
-
-void ui_demo_update_uptime(uint32_t seconds) {
-  screen_debug_update_uptime(seconds);
-}

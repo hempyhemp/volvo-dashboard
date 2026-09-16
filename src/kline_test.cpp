@@ -1,6 +1,6 @@
 // ============================================================
-// Тест K-Line — попытка достучаться до ЭБУ Январь 5.1.61 через
-// донорскую K-Line плату на LM339.
+// K-Line — обмен с ЭБУ Январь 5.1.61 через донорскую K-Line плату на
+// LM339.
 //
 // Физика (плата ESP32-2432S028 / CYD):
 //   Разъём P5 (VIN-TX-RX-GND) НЕЛЬЗЯ использовать — электрически это
@@ -9,42 +9,84 @@
 //   TFT_BL=GPIO21). Используем разъём CN1 (GND-22-27-3V3):
 //     GPIO22 -> TX (в K-Line/донорскую плату)
 //     GPIO27 -> RX (из K-Line/донорской платы)
-//   Полярность подтверждена предыдущими прогонами теста (self-echo
-//   проходит только на прямой логике, без инверсии).
+//   Полярность подтверждена self-echo тестом — только прямая логика.
 //
-// ПРОТОКОЛ — ISO 14230 (KWP2000), "быстрая инициализация":
-//   Взято из задокументированного рабочего кода для ЭБУ Январь 7.2
-//   (тот же протокол у семейства Январь/Bosch Motronic с K-Line).
-//   В отличие от ISO9141 "медленной" (5-бод) инициализации, которую
-//   пробовали раньше, здесь НЕ нужен ни адресный байт на 5 бод, ни
-//   L-line — порт просто открывается сразу на 10400 бод, и шлётся
-//   команда startCommunication. Формат кадра: [длина][адрес ЭБУ][адрес
-//   тестера][сервис/данные...][контрольная сумма = сумма всех
-//   предыдущих байт по модулю 256]:
-//     startCommunication = 81 10 F1 81 03
-//     readData (RLI_ASS)  = 82 10 F1 21 01 A5
-//   K-Line — однопроводная шина: в ответ сначала приходит ЭХО наших же
-//   переданных байт, а затем настоящий ответ ЭБУ. Успешный ответ на
-//   startCommunication содержит байт 0xC1 (позитивный ответ на сервис
-//   0x81); успешный ответ на readData содержит байт 0x61 (позитивный
-//   ответ на сервис 0x21).
-//   Точные смещения байт данных внутри readData-ответа зависят от
-//   конкретной прошивки ЭБУ (у Январь 7.2 и Bosch 7.9.7 они уже
-//   отличаются, см. источник) — на этом этапе тест только проверяет
-//   сам факт ответа (0xC1 / 0x61) и печатает сырые байты в Serial для
-//   дальнейшего разбора, а не пытается парсить конкретные параметры.
+// ПРОТОКОЛ — ISO 14230 (KWP2000), "быстрая инициализация" (порт сразу
+// на 10400 бод, без 5-бодного адресного байта и без L-line). Формат
+// кадра: [длина][адрес ЭБУ][адрес тестера][сервис/данные...][контрольная
+// сумма = сумма всех предыдущих байт по модулю 256]. K-Line
+// однопроводная — в ответе сначала идёт ЭХО наших же переданных байт, а
+// затем настоящий ответ ЭБУ.
+//
+// ПОДТВЕРЖДЕНО НА РЕАЛЬНОМ ЭБУ (2026-09-16):
+//   startCommunication (81 10 F1 81 03) -> 0xC1 в ответе.
+//   readData/RLI_ASS (82 10 F1 21 01 A5) -> 0x61 в ответе, 47 байт
+//   суммарно (6 байт эха запроса + 41 байт настоящего ответа).
+//   Смещения байт параметров ВЗЯТЫ ИЗ ОПУБЛИКОВАННОГО РАБОЧЕГО КОДА для
+//   Январь 7.2 (другая ревизия, но тот же протокол/семейство) и
+//   ПРОВЕРЕНЫ на этом конкретном 5.1.61: с реальными данными получили
+//   температуру ОЖ ~20°C и напряжение ~11.95В — оба значения совпали с
+//   реальными условиями на столе (комнатная температура, БП ~12В), это
+//   и есть подтверждение, что раскладка байт та же. Индексы ниже — от
+//   начала ПОЛНОГО принятого буфера (эхо нашего запроса + ответ ЭБУ), с
+//   такими же номерами, что в буфере целиком, включая эхо!:
+//     [10] = 0x61 (позитивный ответ)
+//     [20] = температура ОЖ + 40 (т.е. реальная темп-ра = байт-40)
+//     [22] = положение дросселя, %
+//     [23] = обороты двигателя / 40 (т.е. rpm = байт*40)
+//     [29] = скорость автомобиля, км/ч
+//     [30] = напряжение борт. сети: U = 5.2 + байт*0.05
+//   Остальные параметры (давление, топливо и т.д.) пока не проверены на
+//   этом ЭБУ и не парсятся.
+//
+// АВТОПОДКЛЮЧЕНИЕ (без кнопки):
+//   Раньше подключение запускалось только по кнопке. Идея проверять
+//   готовность ЭБУ по уровню на RX (например, "idle=HIGH значит ЭБУ
+//   запитан") отброшена — на этой линии до включения питания ЭБУ уровень
+//   не определён достоверно без осциллографа, гадать рискованно. Вместо
+//   этого — классический подход (как в реальных рабочих реализациях,
+//   напр. STM32-скетч с периодическим таймером переподключения):
+//   пока не подключены — пробуем startCommunication+readData каждые
+//   KLINE_RECONNECT_INTERVAL_MS; как только ответ получен — переходим в
+//   режим обычного опроса каждые KLINE_POLL_INTERVAL_MS; если опрос
+//   перестал получать ответ — снова пробуем переподключаться. Self-echo
+//   тест (проверка своей же обвязки TX/RX) больше не нужен на каждой
+//   попытке — он уже подтвердил, что железо исправно, эта проверка
+//   осталась только в ручном варианте (кнопка на вкладке DEBUG).
 // ============================================================
 
 #include <Arduino.h>
 #include <lvgl.h>
 #include "kline_test.h"
 #include "screen_debug.h"
+#include "kline_data.h"
 
 #define KLINE_TX_PIN 22
 #define KLINE_RX_PIN 27
 #define KLINE_BAUD 10400
+#define KLINE_POLL_INTERVAL_MS 300
+#define KLINE_RECONNECT_INTERVAL_MS 2000
 
 static HardwareSerial KlineSerial(2); // UART2
+static bool g_connected = false;
+static uint32_t g_last_poll_ms = 0;
+static uint32_t g_last_connect_attempt_ms = 0;
+static bool g_serial_started = false;
+
+// Кадры и контрольные суммы — из задокументированного рабочего кода для
+// Январь 7.2 (формат KWP2000, адрес ЭБУ 0x10, адрес тестера 0xF1).
+static const uint8_t kStopComm[] = {0x81, 0x10, 0xF1, 0x82, 0x04};
+static const uint8_t kStartComm[] = {0x81, 0x10, 0xF1, 0x81, 0x03};
+static const uint8_t kReadData[] = {0x82, 0x10, 0xF1, 0x21, 0x01, 0xA5};
+
+static void kline_ensure_serial_started(void) {
+  if (g_serial_started) {
+    return;
+  }
+  pinMode(KLINE_RX_PIN, INPUT_PULLUP);
+  KlineSerial.begin(KLINE_BAUD, SERIAL_8N1, KLINE_RX_PIN, KLINE_TX_PIN, false);
+  g_serial_started = true;
+}
 
 static bool kline_read_byte(uint8_t *out, uint32_t timeout_ms) {
   uint32_t start = millis();
@@ -58,7 +100,8 @@ static bool kline_read_byte(uint8_t *out, uint32_t timeout_ms) {
 }
 
 // Sanity-check физики линии (без ЭБУ): видит ли RX то, что шлёт TX.
-// K-Line однопроводная — при исправной цепи это всегда должно быть true.
+// Используется только вручную (кнопка на DEBUG) — на эту проверку
+// больше не завязана автоматическая логика подключения, см. шапку файла.
 static bool kline_self_echo_test(void) {
   while (KlineSerial.available()) {
     KlineSerial.read();
@@ -109,72 +152,124 @@ static bool kline_contains(const uint8_t *buf, size_t n, uint8_t value) {
   return false;
 }
 
-static void kline_run_test(void) {
-  screen_debug_set_kline_result("K-Line: тест идёт...", false);
-  lv_refr_now(NULL); // показать статус до блокирующего обмена
-
-  pinMode(KLINE_RX_PIN, INPUT_PULLUP);
-
-  KlineSerial.end();
-  KlineSerial.begin(KLINE_BAUD, SERIAL_8N1, KLINE_RX_PIN, KLINE_TX_PIN, false);
-  delay(50);
-
-  char buf[96];
-
-  Serial.println("K-Line: старт теста (KWP2000, быстрая инициализация)");
-  Serial.println("K-Line: шаг 0 — self-echo (sanity check)");
-  if (!kline_self_echo_test()) {
-    snprintf(buf, sizeof(buf), "K-Line: эха нет - проверь пайку/GND");
-    screen_debug_set_kline_result(buf, false);
-    Serial.println("K-Line: эха нет — раньше было, проверь контакт/GND.");
-    return;
+// Разбирает ответ на readData по смещениям, подтверждённым на реальном
+// ЭБУ (см. комментарий в шапке файла). Возвращает false, если в буфере
+// нет ожидаемых байт (нет 0x61 или ответ короче нужного).
+static bool kline_parse_read_data(const uint8_t *resp, size_t n,
+                                   kline_data_t *out) {
+  if (n <= 30 || resp[10] != 0x61) {
+    return false;
   }
+  out->connected = true;
+  out->coolant_c = (int32_t)resp[20] - 40;
+  out->throttle_pct = resp[22];
+  out->rpm = (int32_t)resp[23] * 40;
+  out->speed_kmh = resp[29];
+  out->voltage = 5.2f + resp[30] * 0.05f;
+  return true;
+}
 
-  // Кадры и контрольные суммы взяты из задокументированного рабочего
-  // кода для Январь 7.2 (тот же формат KWP2000, адрес ЭБУ 0x10, адрес
-  // тестера 0xF1).
-  static const uint8_t stopComm[] = {0x81, 0x10, 0xF1, 0x82, 0x04};
-  static const uint8_t startComm[] = {0x81, 0x10, 0xF1, 0x81, 0x03};
-  static const uint8_t readData[] = {0x82, 0x10, 0xF1, 0x21, 0x01, 0xA5};
-
+// Одна попытка подключения: startCommunication + первый readData. Не
+// блокирует дольше ~300 мс. Возвращает true при успехе.
+static bool kline_try_connect(void) {
   uint8_t resp[64];
 
-  Serial.println("K-Line: шаг 1 — stopCommunication (на всякий случай, "
-                  "ответ не проверяем)");
-  size_t n0 = kline_send_and_collect(stopComm, sizeof(stopComm), 100, resp,
-                                      sizeof(resp));
-  kline_dump_hex("  ответ на stopCommunication", resp, n0);
+  kline_send_and_collect(kStopComm, sizeof(kStopComm), 100, resp,
+                          sizeof(resp)); // на всякий случай, ответ не важен
 
-  Serial.println("K-Line: шаг 2 — startCommunication");
-  size_t n1 = kline_send_and_collect(startComm, sizeof(startComm), 150, resp,
-                                      sizeof(resp));
-  kline_dump_hex("  ответ на startCommunication", resp, n1);
-
+  size_t n1 = kline_send_and_collect(kStartComm, sizeof(kStartComm), 150,
+                                      resp, sizeof(resp));
   if (!kline_contains(resp, n1, 0xC1)) {
-    snprintf(buf, sizeof(buf), "K-Line: нет 0xC1, эхо=%u байт", (unsigned)n1);
-    screen_debug_set_kline_result(buf, false);
-    Serial.println("K-Line: 0xC1 не пришёл — ЭБУ не подтвердил "
-                    "startCommunication. Полные байты см. выше.");
+    return false;
+  }
+
+  size_t n2 = kline_send_and_collect(kReadData, sizeof(kReadData), 150, resp,
+                                      sizeof(resp));
+  kline_dump_hex("K-Line: подключились, ответ на readData", resp, n2);
+
+  kline_data_t kd = {0};
+  if (!kline_parse_read_data(resp, n2, &kd)) {
+    return false;
+  }
+
+  kline_data_set(&kd);
+  return true;
+}
+
+// Кнопка на DEBUG — ручная диагностика: self-echo + немедленная попытка
+// подключения (в обход таймера автоподключения).
+static void kline_manual_test(void) {
+  screen_debug_set_kline_result("K-Line: тест идёт...", false);
+  lv_refr_now(NULL);
+
+  kline_ensure_serial_started();
+
+  Serial.println("K-Line: ручной тест — self-echo");
+  if (!kline_self_echo_test()) {
+    screen_debug_set_kline_result("K-Line: эха нет - проверь пайку/GND",
+                                   false);
     return;
   }
 
-  Serial.println("K-Line: startCommunication OK (0xC1 получен). "
-                  "Шаг 3 — readData (RLI_ASS)");
-  size_t n2 = kline_send_and_collect(readData, sizeof(readData), 150, resp,
-                                      sizeof(resp));
-  kline_dump_hex("  ответ на readData", resp, n2);
-
-  if (kline_contains(resp, n2, 0x61)) {
-    snprintf(buf, sizeof(buf), "K-Line OK: 0xC1+0x61, данные %u байт",
-             (unsigned)n2);
-    screen_debug_set_kline_result(buf, true);
+  g_last_connect_attempt_ms = millis();
+  if (kline_try_connect()) {
+    g_connected = true;
+    g_last_poll_ms = millis();
+    screen_debug_set_kline_result("K-Line OK (авто-опрос включен)", true);
   } else {
-    snprintf(buf, sizeof(buf), "K-Line: 0xC1 есть, но нет 0x61 (см. Serial)");
-    screen_debug_set_kline_result(buf, true);
+    g_connected = false;
+    screen_debug_set_kline_result("K-Line: эхо есть, ЭБУ не ответил", false);
   }
 }
 
+// Вызывать из loop() на каждой итерации, передавая millis(). Без
+// подключения — пробует подключиться раз в KLINE_RECONNECT_INTERVAL_MS;
+// после подключения — опрашивает раз в KLINE_POLL_INTERVAL_MS. Каждая
+// попытка/опрос блокирует до ~300-400 мс — известный компромисс для
+// текущего этапа, LVGL на это время подвиснет.
+void kline_test_poll(uint32_t now_ms) {
+  kline_ensure_serial_started();
+
+  if (!g_connected) {
+    if (now_ms - g_last_connect_attempt_ms < KLINE_RECONNECT_INTERVAL_MS) {
+      return;
+    }
+    g_last_connect_attempt_ms = now_ms;
+
+    if (kline_try_connect()) {
+      g_connected = true;
+      g_last_poll_ms = now_ms;
+      screen_debug_set_kline_result("K-Line OK (авто-опрос включен)", true);
+    } else {
+      screen_debug_set_kline_result("K-Line: жду ЭБУ (авто-переподключение)",
+                                     false);
+    }
+    return;
+  }
+
+  if (now_ms - g_last_poll_ms < KLINE_POLL_INTERVAL_MS) {
+    return;
+  }
+  g_last_poll_ms = now_ms;
+
+  uint8_t resp[64];
+  size_t n = kline_send_and_collect(kReadData, sizeof(kReadData), 150, resp,
+                                     sizeof(resp));
+
+  kline_data_t kd = {0};
+  if (!kline_parse_read_data(resp, n, &kd)) {
+    g_connected = false;
+    kline_data_t empty = {0};
+    kline_data_set(&empty);
+    screen_debug_set_kline_result("K-Line: потеряна связь, переподключаюсь",
+                                   false);
+    return;
+  }
+
+  kline_data_set(&kd);
+}
+
 void kline_test_register(void) {
-  pinMode(KLINE_RX_PIN, INPUT_PULLUP);
-  screen_debug_set_kline_test_cb(kline_run_test);
+  kline_ensure_serial_started();
+  screen_debug_set_kline_test_cb(kline_manual_test);
 }

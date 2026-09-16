@@ -183,7 +183,7 @@ void loop() {
   lastTick = now;
   lv_timer_handler();
 
-  ui_demo_update_uptime(now / 1000);
+  kline_test_poll(now);
 
   if (now - lastBeat >= 3000) {
     lastBeat = now;

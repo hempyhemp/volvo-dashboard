@@ -1,5 +1,6 @@
 #include "screen_online.h"
 #include "images/img_cat_bg.h"
+#include "kline_data.h"
 #include <stdbool.h>
 #include <stdlib.h>
 
@@ -72,10 +73,36 @@ static void apply_new_value(param_t *p, int32_t new_value) {
   lv_label_set_text(p->value_label, buf);
 }
 
-static void mock_update_timer_cb(lv_timer_t *timer) {
+// Параметры, для которых уже известна раскладка байт K-Line (см.
+// project-заметки: readData/RLI_ASS, byte offsets подтверждены на
+// реальном ЭБУ Январь 5.1.61) — на реальном железе (ESP32) заменяются
+// живыми данными из kline_data.h; в PC-симуляторе kline_data_get()
+// всегда возвращает connected=false, так что там они как и раньше мок.
+static void update_timer_cb(lv_timer_t *timer) {
   (void)timer;
+
+  kline_data_t kd;
+  kline_data_get(&kd);
+
   for (int i = 0; i < PARAM_COUNT; i++) {
     param_t *p = &params[i];
+
+    if (kd.connected && i == P_RPM) {
+      apply_new_value(p, kd.rpm);
+      continue;
+    }
+    if (kd.connected && i == P_COOLANT) {
+      apply_new_value(p, kd.coolant_c);
+      continue;
+    }
+    if (kd.connected && i == P_VOLT) {
+      apply_new_value(p, (int32_t)(kd.voltage * 10 + 0.5f));
+      continue;
+    }
+
+    // Остальные параметры (BOOST, AIR_T, OIL_P, OIL_T, IGN) — раскладка
+    // байт для них ещё не найдена (нужна нестандартная прошивка TRS251
+    // с доп. RLI, см. project-заметки), пока мок.
     int32_t delta = (rand() % (2 * p->step + 1)) - p->step;
     int32_t next = p->current + delta;
     if (next < p->min) next = p->min;
@@ -207,5 +234,5 @@ void screen_online_create(lv_obj_t *parent) {
     lv_label_set_text(params[i].value_label, buf);
   }
 
-  lv_timer_create(mock_update_timer_cb, 700, NULL);
+  lv_timer_create(update_timer_cb, 700, NULL);
 }
