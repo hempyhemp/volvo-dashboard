@@ -3,6 +3,7 @@
 #include "kline_data.h"
 #include <stdbool.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 // ============================================================
 // Вкладка ONLINE — черновик будущей приборки.
@@ -96,7 +97,13 @@ static void update_timer_cb(lv_timer_t *timer) {
       continue;
     }
     if (kd.connected && i == P_VOLT) {
-      apply_new_value(p, (int32_t)(kd.voltage * 10 + 0.5f));
+      // Точное напряжение с 2 знаками после запятой — в обход
+      // scale10-механизма format_value() (тот даёт только 1 знак, из-за
+      // чего 11.95В отображалось как округлённые "12.0").
+      p->current = (int32_t)(kd.voltage * 100 + 0.5f);
+      char buf[24];
+      snprintf(buf, sizeof(buf), "%.2f%s", (double)kd.voltage, p->unit);
+      lv_label_set_text(p->value_label, buf);
       continue;
     }
 
