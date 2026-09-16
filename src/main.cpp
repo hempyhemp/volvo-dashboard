@@ -17,6 +17,7 @@
 #include <XPT2046_Touchscreen.h>
 #include <lvgl.h>
 #include "ui_demo.h"
+#include "kline_test.h"
 
 TFT_eSPI tft = TFT_eSPI();
 
@@ -164,6 +165,7 @@ void setup() {
   lv_indev_set_read_cb(touch_indev, lvgl_touch_read_cb);
 
   ui_demo_create();
+  kline_test_register();
 
   Serial.println("DISPLAY TEST OK");
   Serial.println("========================");

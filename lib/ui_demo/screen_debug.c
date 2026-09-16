@@ -5,6 +5,18 @@
 // вообще работают. Ничего "приборного" тут нет — это техническая вкладка.
 
 static lv_obj_t *uptime_label;
+static lv_obj_t *kline_result_label;
+static void (*kline_test_cb)(void) = NULL;
+
+static void kline_btn_event_cb(lv_event_t *e) {
+  (void)e;
+  if (kline_test_cb != NULL) {
+    kline_test_cb();
+  } else {
+    // PC-симулятор: ESP32-only модуль kline_test.cpp сюда не слинкован.
+    screen_debug_set_kline_result("K-Line: недоступно в симуляторе", false);
+  }
+}
 
 void screen_debug_create(lv_obj_t *parent) {
   lv_obj_set_style_bg_color(parent, lv_color_black(), 0);
@@ -44,6 +56,39 @@ void screen_debug_create(lv_obj_t *parent) {
   lv_label_set_text(uptime_label, "Uptime: 0 s");
   lv_obj_set_style_text_color(uptime_label, lv_color_white(), 0);
   lv_obj_align(uptime_label, LV_ALIGN_TOP_LEFT, 10, 145);
+
+  // --- Тест K-Line (ЭБУ Январь 5.1) ---
+  // Сам обмен по UART реализован в src/kline_test.cpp (только ESP32,
+  // недоступен в PC-симуляторе) — здесь только кнопка и вывод результата.
+  lv_obj_t *kline_btn = lv_button_create(parent);
+  lv_obj_set_pos(kline_btn, 10, 172);
+  lv_obj_set_size(kline_btn, 180, 30);
+  lv_obj_add_event_cb(kline_btn, kline_btn_event_cb, LV_EVENT_CLICKED, NULL);
+
+  lv_obj_t *kline_btn_label = lv_label_create(kline_btn);
+  lv_label_set_text(kline_btn_label, "K-Line: инициализация");
+  lv_obj_set_style_text_font(kline_btn_label, &font_cyrillic_16, 0);
+  lv_obj_center(kline_btn_label);
+
+  kline_result_label = lv_label_create(parent);
+  lv_label_set_text(kline_result_label, "K-Line: не запускался");
+  lv_obj_set_style_text_font(kline_result_label, &font_cyrillic_16, 0);
+  lv_obj_set_style_text_color(kline_result_label, lv_color_hex(0x8C8C97), 0);
+  lv_obj_align(kline_result_label, LV_ALIGN_TOP_LEFT, 10, 208);
+}
+
+void screen_debug_set_kline_test_cb(void (*cb)(void)) {
+  kline_test_cb = cb;
+}
+
+void screen_debug_set_kline_result(const char *text, bool success) {
+  if (kline_result_label == NULL) {
+    return;
+  }
+  lv_label_set_text(kline_result_label, text);
+  lv_obj_set_style_text_color(
+      kline_result_label,
+      success ? lv_color_hex(0x00FF00) : lv_color_hex(0xFF6666), 0);
 }
 
 void screen_debug_update_uptime(uint32_t seconds) {
