@@ -6,10 +6,18 @@
 #include <stdio.h>
 
 // ============================================================
-// Вкладка ONLINE — черновик будущей приборки.
-// Все параметры сейчас МОКОВЫЕ (случайное блуждание в реалистичных
-// пределах) — реального обмена с ЭБУ по K-Line ещё нет, это только
-// прикидка внешнего вида и анимаций.
+// Вкладка ONLINE — черновик приборки.
+//
+// На реальном железе (сборка с ARDUINO) — только настоящие данные с
+// K-Line: RPM/COOLANT/VOLT показываются, когда kline_data.connected,
+// иначе "--"; остальные параметры (BOOST/AIR_T/OIL_P/OIL_T/IGN) — байты
+// для них ещё не найдены (см. docs/KLINE.md), поэтому всегда "--".
+// Никогда не подставляем случайные цифры вместо реальных показаний —
+// на приборке это выглядело бы как настоящая телеметрия.
+//
+// В PC-симуляторе (сборка без ARDUINO) реального K-Line не будет никогда
+// — там все параметры как и раньше моковые (случайное блуждание в
+// реалистичных пределах), для разработки/просмотра интерфейса без платы.
 //
 // Иерархия важности параметров (по месту на экране и типу индикатора):
 //   - главный, по центру, дуга большего размера: BOOST (давление турбины)
@@ -74,42 +82,69 @@ static void apply_new_value(param_t *p, int32_t new_value) {
   lv_label_set_text(p->value_label, buf);
 }
 
-// Параметры, для которых уже известна раскладка байт K-Line (см.
-// project-заметки: readData/RLI_ASS, byte offsets подтверждены на
-// реальном ЭБУ Январь 5.1.61) — на реальном железе (ESP32) заменяются
-// живыми данными из kline_data.h; в PC-симуляторе kline_data_get()
-// всегда возвращает connected=false, так что там они как и раньше мок.
+static void show_dash(param_t *p) {
+  lv_label_set_text(p->value_label, "--");
+  if (p->kind == KIND_ARC) {
+    lv_arc_set_value(p->widget, p->min);
+  }
+  p->current = p->min;
+}
+
+static void show_volt(param_t *p, bool connected, float voltage) {
+  if (!connected) {
+    show_dash(p);
+    return;
+  }
+  // Точное напряжение с 2 знаками после запятой — в обход scale10-
+  // механизма format_value() (тот даёт только 1 знак, из-за чего
+  // 11.95В отображалось как округлённые "12.0").
+  p->current = (int32_t)(voltage * 100 + 0.5f);
+  char buf[24];
+  snprintf(buf, sizeof(buf), "%.2f%s", (double)voltage, p->unit);
+  lv_label_set_text(p->value_label, buf);
+}
+
+#ifdef ARDUINO
+// Реальное железо: показываем только то, что реально знаем с K-Line.
+// Никогда не подставляем случайные "правдоподобные" цифры вместо
+// отсутствующих данных — на приборке это выглядело бы как настоящие
+// показания. RPM/COOLANT/VOLT — подтверждены. IGN и BOOST — байты
+// НЕ подтверждены (кандидаты из стороннего кода, см. docs/KLINE.md),
+// но уже подключены по просьбе пользователя для проверки на месте;
+// формулы/масштаб могут поменяться. AIR_T/OIL_P/OIL_T — байтов ещё нет
+// вообще, всегда "--".
 static void update_timer_cb(lv_timer_t *timer) {
   (void)timer;
 
   kline_data_t kd;
   kline_data_get(&kd);
 
+  if (kd.connected) {
+    apply_new_value(&params[P_RPM], kd.rpm);
+    apply_new_value(&params[P_COOLANT], kd.coolant_c);
+    apply_new_value(&params[P_IGN], kd.ign_deg);
+    // BOOST: диапазон/единицы дуги (0..20 "bar") рассчитаны на
+    // подтверждённое давление, а не на сырое число — сюда пока просто
+    // отдаём boost_raw как есть, дуга визуально упрётся в максимум,
+    // если сырое значение больше 20, а текст покажет настоящее число.
+    apply_new_value(&params[P_BOOST], kd.boost_raw);
+  } else {
+    show_dash(&params[P_RPM]);
+    show_dash(&params[P_COOLANT]);
+    show_dash(&params[P_IGN]);
+    show_dash(&params[P_BOOST]);
+  }
+  show_volt(&params[P_VOLT], kd.connected, kd.voltage);
+}
+#else
+// PC-симулятор: реального K-Line тут никогда не будет — оставляем
+// моковое случайное блуждание по всем параметрам, как и раньше, для
+// разработки/просмотра интерфейса без платы.
+static void update_timer_cb(lv_timer_t *timer) {
+  (void)timer;
+
   for (int i = 0; i < PARAM_COUNT; i++) {
     param_t *p = &params[i];
-
-    if (kd.connected && i == P_RPM) {
-      apply_new_value(p, kd.rpm);
-      continue;
-    }
-    if (kd.connected && i == P_COOLANT) {
-      apply_new_value(p, kd.coolant_c);
-      continue;
-    }
-    if (kd.connected && i == P_VOLT) {
-      // Точное напряжение с 2 знаками после запятой — в обход
-      // scale10-механизма format_value() (тот даёт только 1 знак, из-за
-      // чего 11.95В отображалось как округлённые "12.0").
-      p->current = (int32_t)(kd.voltage * 100 + 0.5f);
-      char buf[24];
-      snprintf(buf, sizeof(buf), "%.2f%s", (double)kd.voltage, p->unit);
-      lv_label_set_text(p->value_label, buf);
-      continue;
-    }
-
-    // Остальные параметры (BOOST, AIR_T, OIL_P, OIL_T, IGN) — раскладка
-    // байт для них ещё не найдена (нужна нестандартная прошивка TRS251
-    // с доп. RLI, см. project-заметки), пока мок.
     int32_t delta = (rand() % (2 * p->step + 1)) - p->step;
     int32_t next = p->current + delta;
     if (next < p->min) next = p->min;
@@ -117,6 +152,7 @@ static void update_timer_cb(lv_timer_t *timer) {
     apply_new_value(p, next);
   }
 }
+#endif
 
 // --- Главный/второстепенный индикатор: дуга ---
 static void make_arc(param_t *p, lv_obj_t *parent, lv_coord_t x, lv_coord_t y,
@@ -239,11 +275,19 @@ void screen_online_create(lv_obj_t *parent) {
   }
 
   // Проставляем стартовые тексты значений (после создания виджетов).
+#ifdef ARDUINO
+  // Реальное железо: до первого успешного опроса K-Line данных ещё нет —
+  // сразу показываем "--", а не моковые стартовые числа.
+  for (int i = 0; i < PARAM_COUNT; i++) {
+    show_dash(&params[i]);
+  }
+#else
   for (int i = 0; i < PARAM_COUNT; i++) {
     char buf[24];
     format_value(&params[i], buf, sizeof(buf));
     lv_label_set_text(params[i].value_label, buf);
   }
+#endif
 
   lv_timer_create(update_timer_cb, 700, NULL);
 }

@@ -21,6 +21,11 @@ typedef struct {
   int32_t throttle_pct;
   int32_t speed_kmh;
   float voltage;
+  int32_t ign_deg;   // угол опережения зажигания, byte[28]*10/2/10 — из
+                      // стороннего кода, ещё НЕ проверено на этом ЭБУ
+  int32_t boost_raw; // "сырой" 16-бит из byte[34]/[35] — в реф-коде это
+                      // MAF (расход воздуха), тут временно используется
+                      // как кандидат на MAP/ДАД, единицы НЕ подтверждены
 } kline_data_t;
 
 void kline_data_set(const kline_data_t *data);
