@@ -36,20 +36,34 @@ typedef struct {
   lv_obj_t *value_label; // текст значения (внутри дуги/бара или сам по себе)
   int32_t current, min, max, step;
   const char *unit;
-  bool scale10; // true → реальное значение = current/10 (для дробных величин)
+  bool scale10;  // true → реальное значение = current/10 (1 знак после точки)
+  bool scale100; // true → реальное значение = current/100 (2 знака, для буста)
 } param_t;
 
 #define PARAM_COUNT 8
 enum { P_BOOST, P_RPM, P_AIR_T, P_COOLANT, P_VOLT, P_OIL_P, P_OIL_T, P_IGN };
 
+// Атмосферное давление (кПа) — точка отсчёта манометрического давления
+// наддува. 100 кПа даёт ~0 при включённом зажигании и заглушенном моторе.
+// Для точного нуля можно подставить реальное показание MAP в этот момент.
+#define KLINE_BARO_KPA 100
+
 static param_t params[PARAM_COUNT];
 
 static void format_value(param_t *p, char *buf, size_t buf_size) {
-  if (p->scale10) {
-    lv_snprintf(buf, buf_size, "%ld.%ld%s", (long)(p->current / 10),
-                (long)(p->current % 10), p->unit);
+  // Корректный знак для отрицательных дробных значений (например,
+  // разрежение во впуске -0.70bar): без выноса минуса current=-70
+  // печаталось бы как "0.-70". Работаем с модулем, знак отдельно.
+  long v = (long)p->current;
+  const char *sign = (v < 0) ? "-" : "";
+  long av = (v < 0) ? -v : v;
+  if (p->scale100) {
+    lv_snprintf(buf, buf_size, "%s%ld.%02ld%s", sign, av / 100, av % 100,
+                p->unit);
+  } else if (p->scale10) {
+    lv_snprintf(buf, buf_size, "%s%ld.%ld%s", sign, av / 10, av % 10, p->unit);
   } else {
-    lv_snprintf(buf, buf_size, "%ld%s", (long)p->current, p->unit);
+    lv_snprintf(buf, buf_size, "%ld%s", v, p->unit);
   }
 }
 
@@ -123,11 +137,23 @@ static void update_timer_cb(lv_timer_t *timer) {
     apply_new_value(&params[P_RPM], kd.rpm);
     apply_new_value(&params[P_COOLANT], kd.coolant_c);
     apply_new_value(&params[P_IGN], kd.ign_deg);
-    // BOOST: диапазон/единицы дуги (0..20 "bar") рассчитаны на
-    // подтверждённое давление, а не на сырое число — сюда пока просто
-    // отдаём boost_raw как есть, дуга визуально упрётся в максимум,
-    // если сырое значение больше 20, а текст покажет настоящее число.
-    apply_new_value(&params[P_BOOST], kd.boost_raw);
+    // BOOST: kd.boost_raw — это абсолютное давление во впуске (MAP) в кПа
+    // (подтверждено: на ХХ ~30 кПа, трекает ДАД; прошивка отдаёт по
+    // XDATA 0xF841 значение в кПа). Показываем МАНОМЕТРИЧЕСКОЕ давление
+    // (относительно атмосферы): разрежение при MAP < атмосферы, наддув
+    // при MAP > атмосферы. В десятых долях бара: (MAP - Патм) / 10.
+    //   ХХ:    (30 - 100)/10  = -7  → "-0.7bar" (разрежение)
+    //   ключ:  (100 - 100)/10 =  0  → "0.0bar"
+    //   наддув:(150 - 100)/10 =  5  → "0.5bar"
+    // В СОТЫХ долях бара: 1 кПа = 0.01 бар, поэтому сотые = (MAP - Патм)
+    // напрямую, с полным разрешением 1 кПа.
+    //   ХХ:    30 - 100  = -70 → "-0.70bar" (разрежение)
+    //   ключ:  100 - 100 =   0 → "0.00bar"
+    //   наддув:150 - 100 =  50 → "0.50bar"
+    // KLINE_BARO_KPA можно подстроить под реальное показание при
+    // включённом зажигании и заглушенном моторе (чтобы там был ровно 0).
+    int32_t boost_cbar = kd.boost_raw - KLINE_BARO_KPA;
+    apply_new_value(&params[P_BOOST], boost_cbar);
   } else {
     show_dash(&params[P_RPM]);
     show_dash(&params[P_COOLANT]);
@@ -230,7 +256,13 @@ void screen_online_create(lv_obj_t *parent) {
 
   srand((unsigned int)lv_tick_get());
 
-  params[P_BOOST] = (param_t){KIND_ARC, NULL, NULL, 4, 0, 20, 2, "bar", true};
+  // BOOST — манометрическое давление наддува/разрежения в бар с точностью
+  // до сотых (scale100 → current в сотых долях бара). Диапазон дуги
+  // -100..200 = -1.00..+2.00 бар: слева разрежение (ХХ ~ -0.70 бар),
+  // справа наддув. Физический источник — абсолютное давление MAP в кПа
+  // (1 кПа = 0.01 бар, см. update_timer_cb).
+  params[P_BOOST] =
+      (param_t){KIND_ARC, NULL, NULL, 0, -100, 200, 5, "bar", false, true};
   params[P_RPM] = (param_t){KIND_ARC, NULL, NULL, 900, 0, 7000, 250, "", false};
   params[P_AIR_T] = (param_t){KIND_ARC, NULL, NULL, 22, 0, 60, 2, "C", false};
   params[P_COOLANT] = (param_t){KIND_LABEL, NULL, NULL, 88, 60, 115, 2, "C", false};
