@@ -2,6 +2,7 @@
 #include "lvgl.h"
 #include "screen_debug.h"
 #include "screen_online.h"
+#include "screen_engine.h"
 
 // Этот файл не знает, где именно он рисуется — на SDL-окне в PC-симуляторе
 // или на реальном TFT_eSPI/ILI9341 через LVGL. Поэтому здесь нет ничего
@@ -47,9 +48,11 @@ void ui_demo_create(void) {
 
   lv_obj_t *tab_debug = lv_tabview_add_tab(tv, "DEBUG");
   lv_obj_t *tab_online = lv_tabview_add_tab(tv, "ONLINE");
+  lv_obj_t *tab_engine = lv_tabview_add_tab(tv, "ENGINE");
 
   style_tab_bar_dark(tv);
 
   screen_debug_create(tab_debug);
   screen_online_create(tab_online);
+  screen_engine_create(tab_engine);
 }

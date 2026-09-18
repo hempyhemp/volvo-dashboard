@@ -27,6 +27,7 @@ add_executable(sim
     ../lib/ui_demo/ui_demo.c
     ../lib/ui_demo/screen_debug.c
     ../lib/ui_demo/screen_online.c
+    ../lib/ui_demo/screen_engine.c
     ../lib/ui_demo/kline_data.c
     ../lib/ui_demo/fonts/font_cyrillic_16.c
     ../lib/ui_demo/images/img_cat_bg.c

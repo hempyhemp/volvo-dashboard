@@ -23,9 +23,21 @@ typedef struct {
   float voltage;
   int32_t ign_deg;   // угол опережения зажигания, byte[28]*10/2/10 — из
                       // стороннего кода, ещё НЕ проверено на этом ЭБУ
-  int32_t boost_raw; // "сырой" 16-бит из byte[34]/[35] — в реф-коде это
-                      // MAF (расход воздуха), тут временно используется
-                      // как кандидат на MAP/ДАД, единицы НЕ подтверждены
+  int32_t boost_raw; // абсолютное давление во впуске (MAP) в кПа
+                      // (XDATA 0xF841, подтверждено физически; на ХХ ~30)
+  int32_t air_temp_c;    // температура воздуха на впуске (ДТВ), °C —
+                         // читается отдельной командой ReadMemoryByAddress
+                         // (SID 0x23) из XDATA 0xF885, в readData её нет
+  bool air_temp_valid;   // true, если air_temp_c реально прочитан с ЭБУ
+
+  // --- Параметры вкладки МОТОР ---
+  int32_t gbc;           // цикловое наполнение воздухом (GBC), сырое 16-бит
+                         // из readData [36]-[37] (XDATA 0xF808)
+  int32_t corr_cn;       // поправка ЦН (XDATA 0xF942), сырой байт, SID 0x23
+  int32_t corr_coolant;  // коррекция ЦН по темп. ОЖ (0xF99C), сырой байт
+  int32_t corr_charge;   // коррекция ЦН по темп. заряда (0xF99D), сырой байт
+  int32_t charge_temp_c; // температура заряда (0xF99E), °C (те же -40, что ДТВ)
+  bool ext_valid;        // true, если доп. блок (SID 0x23) реально прочитан
 } kline_data_t;
 
 void kline_data_set(const kline_data_t *data);

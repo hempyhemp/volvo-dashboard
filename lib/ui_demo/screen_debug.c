@@ -89,7 +89,7 @@ void screen_debug_create(lv_obj_t *parent) {
   lv_obj_set_style_pad_all(parent, 0, 0);
 
   lv_obj_t *title = lv_label_create(parent);
-  lv_label_set_text(title, "K-Line - ЭБУ Январь 5.1.61");
+  lv_label_set_text(title, "K-Line - ЭБУ Январь 5.1");
   lv_obj_set_style_text_font(title, &font_cyrillic_16, 0);
   lv_obj_set_style_text_color(title, lv_color_hex(0x8C8C97), 0);
   lv_obj_align(title, LV_ALIGN_TOP_LEFT, 10, 6);

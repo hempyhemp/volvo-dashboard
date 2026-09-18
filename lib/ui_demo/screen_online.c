@@ -154,11 +154,19 @@ static void update_timer_cb(lv_timer_t *timer) {
     // включённом зажигании и заглушенном моторе (чтобы там был ровно 0).
     int32_t boost_cbar = kd.boost_raw - KLINE_BARO_KPA;
     apply_new_value(&params[P_BOOST], boost_cbar);
+    // AIR_T (ДТВ) читается отдельной командой (SID 0x23, XDATA 0xF885),
+    // приходит не каждый цикл — показываем, только когда реально прочитан.
+    if (kd.air_temp_valid) {
+      apply_new_value(&params[P_AIR_T], kd.air_temp_c);
+    } else {
+      show_dash(&params[P_AIR_T]);
+    }
   } else {
     show_dash(&params[P_RPM]);
     show_dash(&params[P_COOLANT]);
     show_dash(&params[P_IGN]);
     show_dash(&params[P_BOOST]);
+    show_dash(&params[P_AIR_T]);
   }
   show_volt(&params[P_VOLT], kd.connected, kd.voltage);
 }
@@ -264,7 +272,8 @@ void screen_online_create(lv_obj_t *parent) {
   params[P_BOOST] =
       (param_t){KIND_ARC, NULL, NULL, 0, -100, 200, 5, "bar", false, true};
   params[P_RPM] = (param_t){KIND_ARC, NULL, NULL, 900, 0, 7000, 250, "", false};
-  params[P_AIR_T] = (param_t){KIND_ARC, NULL, NULL, 22, 0, 60, 2, "C", false};
+  params[P_AIR_T] =
+      (param_t){KIND_ARC, NULL, NULL, 22, -20, 90, 2, "C", false, false};
   params[P_COOLANT] = (param_t){KIND_LABEL, NULL, NULL, 88, 60, 115, 2, "C", false};
   params[P_VOLT] = (param_t){KIND_LABEL, NULL, NULL, 138, 110, 148, 2, "V", true};
   params[P_OIL_P] = (param_t){KIND_LABEL, NULL, NULL, 28, 5, 60, 3, "bar", true};
@@ -298,7 +307,7 @@ void screen_online_create(lv_obj_t *parent) {
                    0, 2);
 
   // --- Третьестепенные: просто числа, в ряд внизу ---
-  const char *tertiary_names[] = {"COOLANT", "VOLT", "OIL P", "OIL T", "IGN"};
+  const char *tertiary_names[] = {"WATER", "VOLT", "OIL P", "OIL T", "IGN"};
   int tertiary_idx[] = {P_COOLANT, P_VOLT, P_OIL_P, P_OIL_T, P_IGN};
   lv_coord_t col_w = 64;
   for (int i = 0; i < 5; i++) {

@@ -172,6 +172,18 @@ static uint32_t g_last_poll_ms = 0;
 static uint32_t g_last_connect_attempt_ms = 0;
 static uint32_t g_current_baud = 0; // 0 = ещё не настроен
 
+// Кэш параметров, читаемых отдельной командой SID 0x23 (ротацией, см.
+// kExtReads и блок про KLINE_AIRTEMP_INTERVAL_MS ниже). Меняются медленно,
+// поэтому кэшируем и подмешиваем в каждый kline_data_set.
+static int32_t g_air_temp_c = 0;
+static bool g_air_temp_valid = false;
+static int32_t g_corr_cn = 0;
+static int32_t g_corr_coolant = 0;
+static int32_t g_corr_charge = 0;
+static int32_t g_charge_temp_c = 0;
+static bool g_ext_valid = false; // прочитан ли блок корр+темп заряда
+static uint32_t g_last_airtemp_ms = 0;
+
 // Потолок ожидания ответа в установившемся опросе — зависит от текущей
 // скорости: на 38400 ответ приходит намного быстрее, поэтому меньший
 // потолок = быстрее замечаем обрыв, не рискуя надёжностью на 10400.
@@ -185,6 +197,41 @@ static uint32_t kline_poll_timeout_ms(void) {
 static const uint8_t kStopComm[] = {0x81, 0x10, 0xF1, 0x82, 0x04};
 static const uint8_t kStartComm[] = {0x81, 0x10, 0xF1, 0x81, 0x03};
 static const uint8_t kReadData[] = {0x82, 0x10, 0xF1, 0x21, 0x01, 0xA5};
+
+// ReadMemoryByAddress (SID 0x23) — читает произвольный адрес XDATA, чего
+// нет в штатном readData. Разбор дампа J5TRS251 (2026-09-18): диспетчер
+// SID 0x23 -> обработчик 0xABAA, формат запроса:
+//   23 00 <адрес_hi> <адрес_lo> <длина>  (первый байт обязан быть 0x00,
+//   длина 1..0x77). Ответ содержит 0x63 (=0x23+0x40) и затем <длина> байт.
+// Список доп. адресов, которые опрашиваем по очереди (по одному за слот,
+// раз в KLINE_AIRTEMP_INTERVAL_MS — все эти величины меняются медленно):
+typedef struct {
+  uint8_t hi, lo, len;
+  uint8_t kind; // 0 = ДТВ (воздух); 1 = блок 0xF99C..F99E (корр+темп заряда)
+} kline_ext_read_t;
+static const kline_ext_read_t kExtReads[] = {
+    {0xF8, 0x85, 1, 0}, // температура воздуха (ДТВ)
+    {0xF9, 0x9C, 3, 1}, // корр.ОЖ (F99C), корр.заряд (F99D), темп.заряда (F99E)
+    {0xF9, 0x42, 1, 2}, // поправка ЦН (F942)
+};
+static int g_ext_index = 0;
+
+// Собирает кадр ReadMemoryByAddress для адреса hi:lo длиной len. out >= 9.
+static size_t kline_build_readmem(uint8_t hi, uint8_t lo, uint8_t len,
+                                  uint8_t *out) {
+  out[0] = 0x85; // 0x80 | 5 байт данных (23 00 hi lo len)
+  out[1] = 0x10;
+  out[2] = 0xF1;
+  out[3] = 0x23;
+  out[4] = 0x00;
+  out[5] = hi;
+  out[6] = lo;
+  out[7] = len;
+  uint16_t sum = 0;
+  for (int i = 0; i < 8; i++) sum += out[i];
+  out[8] = (uint8_t)(sum & 0xFF);
+  return 9;
+}
 // Смена скорости на 38400 — из того же STM32-кода (ab38400), формат
 // такой же KWP2000-кадр (сервис 0x10, параметр 0x81 = код "38400").
 // ОТКЛЮЧЕНО (2026-09-17): пробовали считать переход принятым, если ЭБУ
@@ -589,6 +636,18 @@ static bool kline_parse_read_data(const uint8_t *resp, size_t n,
   // же, что и в остальном разборе (полный буфер, эхо включено).
   out->ign_deg = ((int32_t)resp[28] * 10 / 2) / 10;
   out->boost_raw = (int32_t)resp[34] | ((int32_t)resp[35] << 8);
+  // Цикловое наполнение (GBC) — XDATA 0xF808, лежит в readData [36]-[37]
+  // (16-бит, младший байт первым, как у MAP).
+  out->gbc = (int32_t)resp[36] | ((int32_t)resp[37] << 8);
+  // Параметры, читаемые отдельной командой (SID 0x23) — подмешиваем
+  // последние кэшированные значения, чтобы readData их не сбрасывал.
+  out->air_temp_c = g_air_temp_c;
+  out->air_temp_valid = g_air_temp_valid;
+  out->corr_cn = g_corr_cn;
+  out->corr_coolant = g_corr_coolant;
+  out->corr_charge = g_corr_charge;
+  out->charge_temp_c = g_charge_temp_c;
+  out->ext_valid = g_ext_valid;
   return true;
 }
 
@@ -606,7 +665,14 @@ typedef enum {
   KLINE_ST_PROBE_WAIT,         // проба отправлена, ждём 0x50/0x7F/таймаут
   KLINE_ST_SPD_GAP,            // пауза перед очередной пробой смены скорости
   KLINE_ST_SPD_WAIT,           // проба смены скорости отправлена, ждём ответ
+  KLINE_ST_EXT_WAIT,           // ReadMemoryByAddress (SID 0x23) отправлен
 } kline_state_t;
+
+// Доп. параметры (SID 0x23) читаются по очереди, не каждый цикл — они
+// меняются медленно. Кэшируем и подмешиваем в каждый kline_data_set
+// (иначе readData затирал бы их). Переменные объявлены выше (рядом с
+// g_current_baud) — нужны в kline_parse_read_data, определённом раньше.
+#define KLINE_AIRTEMP_INTERVAL_MS 1000
 
 // Минимальная пауза между ответом ЭБУ и следующим запросом тестера
 // (похоже на P3min из KWP2000). В блокирующей версии эта пауза возникала
@@ -1007,10 +1073,24 @@ void kline_test_poll(uint32_t now_ms) {
         return;
       }
       g_last_poll_ms = now_ms;
-      kline_send_only(kReadData, sizeof(kReadData));
-      g_buf_n = 0;
-      g_state_started_ms = now_ms;
-      g_state = KLINE_ST_POLL_WAIT_READ;
+      // Раз в KLINE_AIRTEMP_INTERVAL_MS вместо обычного readData читаем
+      // ОДИН доп. параметр из kExtReads (SID 0x23), по кругу — они
+      // меняются медленно, пропуск одного readData раз в секунду незаметен.
+      if (now_ms - g_last_airtemp_ms >= KLINE_AIRTEMP_INTERVAL_MS) {
+        g_last_airtemp_ms = now_ms;
+        const kline_ext_read_t *er = &kExtReads[g_ext_index];
+        uint8_t frame[9];
+        kline_build_readmem(er->hi, er->lo, er->len, frame);
+        kline_send_only(frame, sizeof(frame));
+        g_buf_n = 0;
+        g_state_started_ms = now_ms;
+        g_state = KLINE_ST_EXT_WAIT;
+      } else {
+        kline_send_only(kReadData, sizeof(kReadData));
+        g_buf_n = 0;
+        g_state_started_ms = now_ms;
+        g_state = KLINE_ST_POLL_WAIT_READ;
+      }
     } else {
       if (now_ms - g_last_connect_attempt_ms < KLINE_RECONNECT_INTERVAL_MS) {
         return;
@@ -1018,6 +1098,10 @@ void kline_test_poll(uint32_t now_ms) {
       // Свежее подключение всегда начинается на 10400, даже если до
       // обрыва связи мы успели переключиться на 38400.
       g_fast_active = false;
+      g_air_temp_valid = false; // не показываем устаревшую температуру
+      g_ext_valid = false;
+      g_ext_index = 0;
+      g_last_airtemp_ms = 0;    // прочитать доп. параметры сразу после коннекта
 #if KLINE_AUTO_FAST
       // ВОССТАНОВЛЕНИЕ ПОСЛЕ "ЭБУ завис на 38400" (2026-09-18) — РЕДКОЕ,
       // не перед каждой попыткой! Если бы мы слали 38400-мусор перед
@@ -1152,6 +1236,50 @@ void kline_test_poll(uint32_t now_ms) {
                                      false);
       g_last_connect_attempt_ms = now_ms;
     }
+    g_state = KLINE_ST_IDLE;
+    break;
+  }
+
+  case KLINE_ST_EXT_WAIT: {
+    kline_collect_available(g_buf, &g_buf_n, sizeof(g_buf));
+    const kline_ext_read_t *er = &kExtReads[g_ext_index];
+    // Ответ: 9 байт эха запроса + ответ ЭБУ (0x63 + len байт + чексумма).
+    size_t need = 9 + 3 + er->len; // эхо + [63 ..] с запасом
+    if (g_buf_n < need && (now_ms - g_state_started_ms) < kline_poll_timeout_ms()) {
+      return;
+    }
+    // Ищем 0x63 (=0x23+0x40, позитивный ReadMemoryByAddress) ПОСЛЕ эха.
+    int d = -1;
+    for (size_t i = 9; i + er->len < g_buf_n; i++) {
+      if (g_buf[i] == 0x63) { d = (int)i + 1; break; }
+    }
+    if (d >= 0) {
+      if (er->kind == 0) {
+        // ДТВ: °C со смещением +40 (как ДТОЖ) — проверить по факту.
+        g_air_temp_c = (int32_t)g_buf[d] - 40;
+        g_air_temp_valid = true;
+        Serial.printf("[KL] ДТВ(F885): raw=%u -> %ld C\n", g_buf[d],
+                      (long)g_air_temp_c);
+      } else if (er->kind == 1) {
+        // Блок F99C..F99E: корр.ОЖ, корр.заряд, темп.заряда(+40).
+        g_corr_coolant = g_buf[d];
+        g_corr_charge = g_buf[d + 1];
+        g_charge_temp_c = (int32_t)g_buf[d + 2] - 40;
+        g_ext_valid = true;
+        Serial.printf("[KL] коррЦН ОЖ=%u заряд=%u Tзаряда=%ld C (raw)\n",
+                      g_buf[d], g_buf[d + 1], (long)g_charge_temp_c);
+      } else if (er->kind == 2) {
+        // Поправка ЦН (F942) — сырой байт, масштаб уточнить по факту.
+        g_corr_cn = g_buf[d];
+        Serial.printf("[KL] поправка ЦН(F942): raw=%u\n", g_buf[d]);
+      }
+    } else {
+      Serial.printf("[KL] SID23 kind=%u: нет 0x63, RX:", er->kind);
+      for (size_t i = 0; i < g_buf_n; i++) Serial.printf(" %02X", g_buf[i]);
+      Serial.println();
+    }
+    // следующий доп. параметр в следующий слот
+    g_ext_index = (g_ext_index + 1) % (int)(sizeof(kExtReads) / sizeof(kExtReads[0]));
     g_state = KLINE_ST_IDLE;
     break;
   }
