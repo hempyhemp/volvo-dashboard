@@ -192,15 +192,16 @@ static uint32_t g_current_baud = 0; // 0 = ещё не настроен
 // Кэш параметров, читаемых отдельной командой SID 0x23 (ротацией, см.
 // kExtReads и блок про KLINE_AIRTEMP_INTERVAL_MS ниже). Меняются медленно,
 // поэтому кэшируем и подмешиваем в каждый kline_data_set.
-// Давление и воздух теперь приходят прямо в кадре 0x0F (см. parse) —
-// отдельного кэша не требуют.
+// Воздух приходит прямо в кадре 0x0F (см. parse). Давление (F9A0,
+// «квантованное») в кадр 0x0F НЕ входит (там только ДАД ADC Hi=F80C,
+// младший байт F99A отсутствует) — читаем отдельным SID 0x23 и кэшируем.
+static int32_t g_map_x100 = 0;
+static bool g_map_valid = false;
 static int32_t g_corr_cn = 0;
 static int32_t g_corr_coolant = 0;
 static int32_t g_corr_charge = 0;
 static int32_t g_charge_temp_c = 0;
 static bool g_ext_valid = false; // прочитан ли блок корр+темп заряда
-static float g_voltage = 0.0f;   // напряжение (F978) — редкий SID 0x23,
-                                 // т.к. в жирном кадре LID 0x0F его нет
 
 // РАНТАЙМ-НАСТРАИВАЕМЫЕ тайминги — можно крутить на лету кнопками ±5 на
 // вкладке DEBUG (см. kline_timing_get/adjust). Значения #define выше —
@@ -254,27 +255,29 @@ typedef struct {
   uint8_t hi, lo, len;
   uint8_t kind; // 0 = ДТВ (воздух); 1 = блок 0xF99C..F99E (корр+темп заряда)
 } kline_ext_read_t;
-// АБС.ДАВЛЕНИЕ как в ИОН (подтверждено сниффером, tools/ion-sniffer):
-// сырой АЦП ДАД F80C(hi):F80D(lo) -> кПа по калибровке ~1-бар (105 кПа на
-// полную шкалу АЦП 1023). Теперь ДАД приходит прямо в жирном кадре 0x0F
-// (resp[38]/resp[39]), отдельный запрос не нужен.
-#define KLINE_DAD_MUL 10500 // кПа_x100 = АЦП * 10500 / 1023 (полн.шкала 105 кПа)
-#define KLINE_DAD_DIV 1023  // подстроить по ИОН на холостом/бусте
+// АБС.ДАВЛЕНИЕ — F9A0 «квантованное давление» (посчитано ЭБУ). Проверено
+// на реальном ХХ: 540/12 ≈ 45 ≈ ИОН 45.52. В кадре 0x0F его нет (там лишь
+// ДАД ADC Hi=F80C, без младшего байта), поэтому читаем отдельным коротким
+// SID 0x23 (len 2) и кэшируем. На заглушенной F9A0=0 -> показываем атмосферу.
+static const kline_ext_read_t kMapRead = {0xF9, 0xA0, 2, 3};
+#define KLINE_MAP_DIV 12    // (F9A1<<8|F9A0)/12 = кПа (подстроить по ИОН)
+#define KLINE_BARO_KPA 100  // атмосфера, кПа — подстановка при F9A0=0 (заглушен)
 
 // Медленные доп.параметры (нет в кадре 0x0F) — читаем по кругу, редко.
+// Напряжение теперь берём из кадра 0x0F (F80D), отдельно НЕ читаем.
 static const kline_ext_read_t kSlowReads[] = {
-    {0xF9, 0x78, 1, 4}, // напряжение (F978): В = 5.2 + raw*0.05
     {0xF9, 0x9C, 3, 1}, // корр.ОЖ(F99C), корр.заряд(F99D), темп.заряда(F99E)
     {0xF9, 0x42, 1, 2}, // поправка ЦН (F942)
 };
 static int g_slow_index = 0;
 // Какой ext-запрос сейчас в полёте (для разбора ответа в EXT_WAIT).
 static kline_ext_read_t g_ext_cur = {0, 0, 0, 0};
-// Теперь всё «геройское» (обороты/давление/ОЖ/дроссель) приходит в одном
-// кадре 0x0F каждый опрос — как у ИОН. Медленные параметры (напряжение/
-// коррекции/поправка), которых в кадре нет, читаем по кругу редким SID
-// 0x23: раз в KLINE_SLOW_INTERVAL_MS крадём один опрос под один параметр.
+// Кадр 0x0F (обороты/ОЖ/дроссель/скорость/воздух/GBC/напряжение) СТРОГО
+// чередуем с чтением давления F9A0 (в кадр не входит) — оба «геройские»,
+// каждый обновляется через опрос (~2×интервал). Медленные (коррекции/
+// поправка) читаем раз в KLINE_SLOW_INTERVAL, подменяя очередной опрос.
 #define KLINE_SLOW_INTERVAL_MS 2000 // как часто — один медленный параметр
+static bool g_poll_toggle = false;  // false=кадр 0x0F, true=давление F9A0
 static uint32_t g_last_slow_ms = 0;
 
 // Собирает кадр ReadMemoryByAddress для адреса hi:lo длиной len. out >= 9.
@@ -695,17 +698,16 @@ static bool kline_parse_read_data(const uint8_t *resp, size_t n,
   out->throttle_pct = resp[23];              // RAM 0x52 (data[11])
   out->rpm = (int32_t)resp[24] * 40;         // RAM 0x55 (data[12])
   out->speed_kmh = resp[47];                 // F90A     (data[35])
-  // ДАД АЦП F80C(hi):F80D(lo) big-endian -> абс.давление кПа×100.
-  uint16_t adc = ((uint16_t)resp[38] << 8) | resp[39];
-  out->map_kpa_x100 = (int32_t)adc * KLINE_DAD_MUL / KLINE_DAD_DIV;
-  out->map_valid = true;
+  // Напряжение — F80D (data[27]) прямо из кадра: В = 5.2 + raw*0.05.
+  out->voltage = 5.2f + resp[39] * 0.05f;
   out->air_temp_c = (int32_t)resp[49] - 40;  // F885 (data[37])
   out->air_temp_valid = true;
   // Цикловое наполнение (GBC) — F808 (data[45-46]), младший байт первым.
   out->gbc = (int32_t)resp[57] | ((int32_t)resp[58] << 8);
   out->ign_deg = 0; // УОЗ в кадр 0x0F не входит; ИОН его считает из прошивки
-  // Напряжение и коррекции — из кэша редких SID 0x23 (их нет в кадре 0x0F).
-  out->voltage = g_voltage;
+  // Давление (F9A0) в кадр не входит — из кэша отдельного SID 0x23.
+  out->map_kpa_x100 = g_map_x100;
+  out->map_valid = g_map_valid;
   out->corr_cn = g_corr_cn;
   out->corr_coolant = g_corr_coolant;
   out->corr_charge = g_corr_charge;
@@ -733,7 +735,7 @@ typedef enum {
 
 // Доп. параметры (SID 0x23) кэшируются и подмешиваются в каждый
 // kline_data_set (иначе readData затирал бы их). Переменные и расписание
-// чтений (kMapRead/kSlowReads, KLINE_MAP_INTERVAL_MS/…) объявлены выше.
+// чтений (kMapRead/kSlowReads, g_poll_toggle/KLINE_SLOW_INTERVAL_MS) выше.
 
 // Минимальная пауза между ответом ЭБУ и следующим запросом тестера
 // (похоже на P3min из KWP2000). В блокирующей версии эта пауза возникала
@@ -1134,17 +1136,19 @@ void kline_test_poll(uint32_t now_ms) {
         return;
       }
       g_last_poll_ms = now_ms;
-      // Основной опрос — жирный кадр 0x0F (обороты/ОЖ/дроссель/скорость/
-      // давление/воздух/GBC) каждый цикл, как ИОН. Раз в KLINE_SLOW_INTERVAL_MS
-      // вместо кадра шлём один медленный SID 0x23 (напряжение/коррекции/
-      // поправка — их в кадре 0x0F нет).
+      // Приоритет: раз в KLINE_SLOW_INTERVAL_MS — один медленный SID 0x23
+      // (коррекции/поправка). Иначе строго чередуем кадр 0x0F и давление
+      // F9A0 (тумблер g_poll_toggle) — чтобы кадр не голодал.
       const kline_ext_read_t *er = NULL;
       if (now_ms - g_last_slow_ms >= KLINE_SLOW_INTERVAL_MS) {
         g_last_slow_ms = now_ms;
         er = &kSlowReads[g_slow_index];
         g_slow_index = (g_slow_index + 1) %
                        (int)(sizeof(kSlowReads) / sizeof(kSlowReads[0]));
+      } else if (g_poll_toggle) {
+        er = &kMapRead; // давление F9A0
       }
+      g_poll_toggle = !g_poll_toggle;
       if (er) {
         g_ext_cur = *er;
         uint8_t frame[9];
@@ -1166,10 +1170,12 @@ void kline_test_poll(uint32_t now_ms) {
       // Свежее подключение всегда начинается на 10400, даже если до
       // обрыва связи мы успели переключиться на 38400.
       g_fast_active = false;
+      g_map_valid = false;
       g_ext_valid = false;
       g_slow_index = 0;
       g_poll_miss = 0;
-      g_last_slow_ms = 0; // прочитать доп. параметры сразу после коннекта
+      g_poll_toggle = false; // первый опрос — кадр 0x0F
+      g_last_slow_ms = 0;    // медленные параметры — сразу после коннекта
 #if KLINE_AUTO_FAST
       // ВОССТАНОВЛЕНИЕ ПОСЛЕ "ЭБУ завис на 38400" (2026-09-18) — РЕДКОЕ,
       // не перед каждой попыткой! Если бы мы слали 38400-мусор перед
@@ -1352,9 +1358,13 @@ void kline_test_poll(uint32_t now_ms) {
       if (g_buf[i] == 0x63) { d = (int)i + 1; break; }
     }
     if (d >= 0) {
-      if (er->kind == 4) {
-        // Напряжение (F978): В = 5.2 + raw*0.05 (как было в LID 0x01).
-        g_voltage = 5.2f + g_buf[d] * 0.05f;
+      if (er->kind == 3) {
+        // Давление F9A0 (16-бит) /12 = кПа, храним ×100. F9A0=0 на
+        // заглушенной -> подставляем атмосферу (0 бар буста, как ИОН в машине).
+        uint16_t mv = g_buf[d] | (g_buf[d + 1] << 8);
+        g_map_x100 = (mv == 0) ? (int32_t)KLINE_BARO_KPA * 100
+                               : (int32_t)mv * 100 / KLINE_MAP_DIV;
+        g_map_valid = true;
       } else if (er->kind == 1) {
         // Блок F99C..F99E: корр.ОЖ, корр.заряд, темп.заряда(+40).
         g_corr_coolant = g_buf[d];
