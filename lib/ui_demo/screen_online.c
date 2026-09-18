@@ -78,7 +78,7 @@ static void apply_new_value(param_t *p, int32_t new_value) {
       lv_anim_init(&a);
       lv_anim_set_var(&a, p->widget);
       lv_anim_set_values(&a, p->current, new_value);
-      lv_anim_set_duration(&a, 450);
+      lv_anim_set_duration(&a, 200);
       lv_anim_set_exec_cb(&a, anim_arc_exec_cb);
       lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
       lv_anim_start(&a);
@@ -137,23 +137,19 @@ static void update_timer_cb(lv_timer_t *timer) {
     apply_new_value(&params[P_RPM], kd.rpm);
     apply_new_value(&params[P_COOLANT], kd.coolant_c);
     apply_new_value(&params[P_IGN], kd.ign_deg);
-    // BOOST: kd.boost_raw — это абсолютное давление во впуске (MAP) в кПа
-    // (подтверждено: на ХХ ~30 кПа, трекает ДАД; прошивка отдаёт по
-    // XDATA 0xF841 значение в кПа). Показываем МАНОМЕТРИЧЕСКОЕ давление
-    // (относительно атмосферы): разрежение при MAP < атмосферы, наддув
-    // при MAP > атмосферы. В десятых долях бара: (MAP - Патм) / 10.
-    //   ХХ:    (30 - 100)/10  = -7  → "-0.7bar" (разрежение)
-    //   ключ:  (100 - 100)/10 =  0  → "0.0bar"
-    //   наддув:(150 - 100)/10 =  5  → "0.5bar"
-    // В СОТЫХ долях бара: 1 кПа = 0.01 бар, поэтому сотые = (MAP - Патм)
-    // напрямую, с полным разрешением 1 кПа.
-    //   ХХ:    30 - 100  = -70 → "-0.70bar" (разрежение)
-    //   ключ:  100 - 100 =   0 → "0.00bar"
-    //   наддув:150 - 100 =  50 → "0.50bar"
-    // KLINE_BARO_KPA можно подстроить под реальное показание при
-    // включённом зажигании и заглушенном моторе (чтобы там был ровно 0).
-    int32_t boost_cbar = kd.boost_raw - KLINE_BARO_KPA;
-    apply_new_value(&params[P_BOOST], boost_cbar);
+    // BOOST — МАНОМЕТРИЧЕСКОЕ давление (относительно атмосферы) из абс. MAP.
+    // Источник как в ИОН: сырой АЦП ДАД (F80C/F80D), пересчёт в кПа в
+    // kline_test.cpp -> kd.map_kpa_x100 (кПа×100). Сотые доли бара:
+    //   bar_x100 = map_kpa_x100/100 - KLINE_BARO_KPA
+    //   ХХ ~45 кПа  -> -55 -> "-0.55bar" (разрежение)
+    //   зажигание   ~100 ->   0 -> "0.00bar"
+    //   наддув ~150 ->  50 -> "0.50bar"
+    if (kd.map_valid) {
+      int32_t boost_cbar = kd.map_kpa_x100 / 100 - KLINE_BARO_KPA;
+      apply_new_value(&params[P_BOOST], boost_cbar);
+    } else {
+      show_dash(&params[P_BOOST]);
+    }
     // AIR_T (ДТВ) читается отдельной командой (SID 0x23, XDATA 0xF885),
     // приходит не каждый цикл — показываем, только когда реально прочитан.
     if (kd.air_temp_valid) {

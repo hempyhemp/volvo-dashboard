@@ -14,6 +14,13 @@ pc-sim/vcpkg_installed/
 *_log.txt
 build_log.txt
 
+# Дампы сниффера ИОН (tools/ion-sniffer) — сырой обмен, не для коммита.
+tools/ion-sniffer/ion_sniff_*.log
+
 # Дамп прошивки ЭБУ (TRS251) — личный референс пользователя для
 # reverse engineering K-Line, не часть проекта, не для коммита.
 *.bin
+
+# Python кэш
+__pycache__/
+*.pyc

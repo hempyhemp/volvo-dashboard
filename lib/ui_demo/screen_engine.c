@@ -57,20 +57,46 @@ static void set_int(tile_t *t, bool ok, long v, const char *suffix) {
   lv_label_set_text(t->value, buf);
 }
 
+// Показать значение×100 как X.XX (для давления в кПа с сотыми).
+static void set_x100(tile_t *t, bool ok, long v_x100, const char *suffix) {
+  if (!ok) {
+    lv_label_set_text(t->value, "--");
+    return;
+  }
+  const char *sign = (v_x100 < 0) ? "-" : "";
+  long a = (v_x100 < 0) ? -v_x100 : v_x100;
+  char buf[24];
+  snprintf(buf, sizeof(buf), "%s%ld.%02ld%s", sign, a / 100, a % 100, suffix);
+  lv_label_set_text(t->value, buf);
+}
+
+// Коррекция как отклонение от нейтрали (raw 128 = ×1.00 = 0%).
+static void set_corr_pct(tile_t *t, bool ok, long raw) {
+  if (!ok) {
+    lv_label_set_text(t->value, "--");
+    return;
+  }
+  long pct = (raw - 128) * 100 / 128;
+  char buf[24];
+  snprintf(buf, sizeof(buf), "%+ld%%", pct);
+  lv_label_set_text(t->value, buf);
+}
+
 static void update_cb(lv_timer_t *timer) {
   (void)timer;
   kline_data_t kd;
   kline_data_get(&kd);
 
-  // MAP и GBC приходят в readData — валидны при connected.
-  set_int(&t_map, kd.connected, (long)kd.boost_raw, " kPa");
+  // Абс. давление (MAP) — из 0xF9A0 (SID 0x23), кПа с сотыми.
+  set_x100(&t_map, kd.connected && kd.map_valid, (long)kd.map_kpa_x100, "");
+  // GBC (наполнение) — из readData, валидно при connected.
   set_int(&t_gbc, kd.connected, (long)kd.gbc, "");
   // Остальное — из SID 0x23, валидно при ext_valid.
   bool ext = kd.connected && kd.ext_valid;
   set_int(&t_tcharge, ext, (long)kd.charge_temp_c, " C");
-  set_int(&t_corrcn, ext, (long)kd.corr_cn, "");
-  set_int(&t_corroj, ext, (long)kd.corr_coolant, "");
-  set_int(&t_corrchg, ext, (long)kd.corr_charge, "");
+  set_int(&t_corrcn, ext, (long)kd.corr_cn, "");        // поправка ЦН, raw
+  set_corr_pct(&t_corroj, ext, (long)kd.corr_coolant);  // % от нейтрали
+  set_corr_pct(&t_corrchg, ext, (long)kd.corr_charge);
 }
 
 void screen_engine_create(lv_obj_t *parent) {

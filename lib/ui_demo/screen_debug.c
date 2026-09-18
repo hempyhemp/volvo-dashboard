@@ -14,11 +14,47 @@
 static lv_obj_t *kline_result_label;
 static void (*kline_test_cb)(void) = NULL;
 
+// Живая настройка таймингов (кнопки ±5). Колбэки регистрирует
+// kline_test.cpp (ESP32); в PC-симуляторе NULL → показываем "--".
+static int (*timing_get_cb)(int) = NULL;
+static void (*timing_adjust_cb)(int, int) = NULL;
+static lv_obj_t *lbl_poll_val;
+static lv_obj_t *lbl_timeout_val;
+
 typedef struct {
   lv_obj_t *value;
 } tile_t;
 
 static tile_t tile_rpm, tile_temp, tile_throttle, tile_volt;
+
+// user_data для кнопок ±: какой параметр и на сколько менять.
+typedef struct {
+  int param; // 0=период опроса, 1=потолок ответа
+  int delta;
+} timing_btn_t;
+static timing_btn_t tb_poll_dn = {0, -5}, tb_poll_up = {0, +5};
+static timing_btn_t tb_to_dn = {1, -5}, tb_to_up = {1, +5};
+
+static void refresh_timing_labels(void) {
+  char buf[24];
+  if (timing_get_cb) {
+    snprintf(buf, sizeof(buf), "%dмс", timing_get_cb(0));
+    lv_label_set_text(lbl_poll_val, buf);
+    snprintf(buf, sizeof(buf), "%dмс", timing_get_cb(1));
+    lv_label_set_text(lbl_timeout_val, buf);
+  } else {
+    lv_label_set_text(lbl_poll_val, "--");
+    lv_label_set_text(lbl_timeout_val, "--");
+  }
+}
+
+static void timing_btn_event_cb(lv_event_t *e) {
+  timing_btn_t *tb = (timing_btn_t *)lv_event_get_user_data(e);
+  if (timing_adjust_cb && tb) {
+    timing_adjust_cb(tb->param, tb->delta);
+  }
+  refresh_timing_labels();
+}
 
 static void kline_btn_event_cb(lv_event_t *e) {
   (void)e;
@@ -83,6 +119,43 @@ static void kline_tiles_update_cb(lv_timer_t *timer) {
   lv_label_set_text(tile_volt.value, volt_buf);
 }
 
+// Строка настройки одного тайминга: подпись + значение + кнопки [-5][+5].
+// Возвращает label значения (чтобы обновлять его в refresh_timing_labels).
+static lv_obj_t *make_timing_row(lv_obj_t *parent, lv_coord_t y,
+                                 const char *caption, timing_btn_t *dn,
+                                 timing_btn_t *up) {
+  lv_obj_t *cap = lv_label_create(parent);
+  lv_label_set_text(cap, caption);
+  lv_obj_set_style_text_font(cap, &font_cyrillic_16, 0);
+  lv_obj_set_style_text_color(cap, lv_color_hex(0x8C8C97), 0);
+  lv_obj_set_pos(cap, 8, y + 6);
+
+  lv_obj_t *val = lv_label_create(parent);
+  lv_obj_set_style_text_font(val, &font_cyrillic_16, 0);
+  lv_obj_set_style_text_color(val, lv_color_hex(0x66CCFF), 0);
+  lv_obj_set_pos(val, 120, y + 6);
+
+  lv_obj_t *bminus = lv_button_create(parent);
+  lv_obj_set_pos(bminus, 196, y);
+  lv_obj_set_size(bminus, 54, 30);
+  lv_obj_set_style_bg_color(bminus, lv_color_hex(0x3A3A44), 0);
+  lv_obj_add_event_cb(bminus, timing_btn_event_cb, LV_EVENT_CLICKED, dn);
+  lv_obj_t *lm = lv_label_create(bminus);
+  lv_label_set_text(lm, "-5");
+  lv_obj_center(lm);
+
+  lv_obj_t *bplus = lv_button_create(parent);
+  lv_obj_set_pos(bplus, 256, y);
+  lv_obj_set_size(bplus, 54, 30);
+  lv_obj_set_style_bg_color(bplus, lv_color_hex(0x2C6BFF), 0);
+  lv_obj_add_event_cb(bplus, timing_btn_event_cb, LV_EVENT_CLICKED, up);
+  lv_obj_t *lp = lv_label_create(bplus);
+  lv_label_set_text(lp, "+5");
+  lv_obj_center(lp);
+
+  return val;
+}
+
 void screen_debug_create(lv_obj_t *parent) {
   lv_obj_set_style_bg_color(parent, lv_color_hex(0x0A0A0E), 0);
   lv_obj_set_style_bg_opa(parent, LV_OPA_COVER, 0);
@@ -118,10 +191,26 @@ void screen_debug_create(lv_obj_t *parent) {
   lv_label_set_text(kline_btn_label, "K-Line: переподключить");
   lv_obj_set_style_text_font(kline_btn_label, &font_cyrillic_16, 0);
   lv_obj_center(kline_btn_label);
+
+  // --- Живая настройка таймингов K-Line (кнопки ±5мс) — ниже кнопки,
+  // вкладка скроллится, если не влезает. ---
+  lbl_poll_val = make_timing_row(parent, 212, "ОПРОС", &tb_poll_dn, &tb_poll_up);
+  lbl_timeout_val =
+      make_timing_row(parent, 250, "ТАЙМ.ОТВ", &tb_to_dn, &tb_to_up);
+  refresh_timing_labels();
 }
 
 void screen_debug_set_kline_test_cb(void (*cb)(void)) {
   kline_test_cb = cb;
+}
+
+void screen_debug_set_timing_cb(int (*get)(int param),
+                                void (*adjust)(int param, int delta)) {
+  timing_get_cb = get;
+  timing_adjust_cb = adjust;
+  if (lbl_poll_val) {
+    refresh_timing_labels();
+  }
 }
 
 void screen_debug_set_kline_result(const char *text, bool success) {

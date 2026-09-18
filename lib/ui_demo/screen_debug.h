@@ -24,6 +24,14 @@ void screen_debug_set_kline_test_cb(void (*cb)(void));
 // только для статусных сообщений (подключение/ошибка/self-echo).
 void screen_debug_set_kline_result(const char *text, bool success);
 
+// Регистрирует функции живой настройки таймингов K-Line (кнопки ±5 на
+// DEBUG). get(param) возвращает текущее значение, adjust(param,delta) его
+// меняет. param: 0 = период опроса, 1 = потолок ответа. На ESP32 их
+// регистрирует kline_test.cpp; в PC-симуляторе не регистрируются (кнопки
+// показывают "--").
+void screen_debug_set_timing_cb(int (*get)(int param),
+                                void (*adjust)(int param, int delta));
+
 #ifdef __cplusplus
 }
 #endif

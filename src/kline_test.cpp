@@ -134,7 +134,17 @@
 //  - на 38400: те же 47 байт ~12мс + P2(≤50) → ~75мс достаточно (ровно
 //    столько ставят в ИОН: ReadTimeout=75), см. kline_poll_timeout_ms.
 #define KLINE_RESPONSE_TIMEOUT_MS 150
-#define KLINE_POLL_TIMEOUT_FAST_MS 75
+// Потолок ответа на 38400. 50мс оказалось ВПРИТЫК: ответ readData ~30мс
+// (12мс передача 47 байт + P2 до ~20мс, т.к. ЭБУ отвечает в 20мс-цикле),
+// и при джиттере/помехах кадр иногда не долетал за 50мс → parse fail →
+// разрыв. Ставим 90мс: с запасом над худшим случаем, разрывы уходят, а на
+// скорость обновления это не влияет (стейт-машина выходит сразу по приходу
+// кадра, не пересиживает таймаут).
+// Кадр 0x0F (64 б) на 38400: ~17мс передача + ~48мс отклик ЭБУ ≈ 65мс.
+// ИОН держит read timeout 100мс (COMMTIMEOUTS RC=100) и стабилен. У нас
+// ещё бывает джиттер главного цикла (перерисовка LVGL), поэтому даём запас
+// 120мс; одиночные превышения ловит терпимость к промахам (g_poll_miss).
+#define KLINE_POLL_TIMEOUT_FAST_MS 120
 // Период опроса readData — как часто обновляется приборка. 100мс (~10Гц),
 // было 300. По KWP2000 между концом ответа ЭБУ и следующим запросом нужен
 // P3min (~55мс по стандарту; в ИОН ReqTimeout=75). На 38400 ответ ~40мс,
@@ -142,6 +152,8 @@
 // Ниже (75–90мс) технически можно (ИОН примерно так и гоняет), но зазор
 // становится впритык к P3min: если в Serial пойдут обрезки (n<47) или
 // переподключения — вернуть 100 или выше.
+// 100мс (~10 Гц) — ровно как ИОН (сниффер: интервал ~100мс, отклик ~48мс,
+// зазор P3 ~35мс). Стабильно; ниже P3 становится впритык и растут разрывы.
 #define KLINE_POLL_INTERVAL_MS 100
 // Интервал между попытками подключения. 800мс — достаточно "тишины на
 // шине" для fast-init (нужно ~300мс), но заметно быстрее прежних 2с:
@@ -168,6 +180,11 @@ static HardwareSerial KlineSerial(2); // UART2
 static bool g_connected = false;
 static bool g_fast_active = false; // true = сейчас на повышенной скорости
 static uint8_t g_connect_fail_count = 0; // подряд неудачных попыток коннекта
+// Подряд промахов опроса (нет валидного ответа). ИОН тоже терпит несколько
+// "No answer" перед реконнектом — не рвём сессию на первом же промахе, иначе
+// одиночный джиттер (LVGL перерисовка) роняет связь и гонит полный реконнект.
+static uint8_t g_poll_miss = 0;
+#define KLINE_POLL_MAX_MISS 6 // столько промахов подряд -> считаем связь потерянной
 static uint32_t g_last_poll_ms = 0;
 static uint32_t g_last_connect_attempt_ms = 0;
 static uint32_t g_current_baud = 0; // 0 = ещё не настроен
@@ -175,28 +192,56 @@ static uint32_t g_current_baud = 0; // 0 = ещё не настроен
 // Кэш параметров, читаемых отдельной командой SID 0x23 (ротацией, см.
 // kExtReads и блок про KLINE_AIRTEMP_INTERVAL_MS ниже). Меняются медленно,
 // поэтому кэшируем и подмешиваем в каждый kline_data_set.
-static int32_t g_air_temp_c = 0;
-static bool g_air_temp_valid = false;
+// Давление и воздух теперь приходят прямо в кадре 0x0F (см. parse) —
+// отдельного кэша не требуют.
 static int32_t g_corr_cn = 0;
 static int32_t g_corr_coolant = 0;
 static int32_t g_corr_charge = 0;
 static int32_t g_charge_temp_c = 0;
 static bool g_ext_valid = false; // прочитан ли блок корр+темп заряда
-static uint32_t g_last_airtemp_ms = 0;
+static float g_voltage = 0.0f;   // напряжение (F978) — редкий SID 0x23,
+                                 // т.к. в жирном кадре LID 0x0F его нет
 
-// Потолок ожидания ответа в установившемся опросе — зависит от текущей
-// скорости: на 38400 ответ приходит намного быстрее, поэтому меньший
-// потолок = быстрее замечаем обрыв, не рискуя надёжностью на 10400.
+// РАНТАЙМ-НАСТРАИВАЕМЫЕ тайминги — можно крутить на лету кнопками ±5 на
+// вкладке DEBUG (см. kline_timing_get/adjust). Значения #define выше —
+// стартовые. На 10400 (коннект) потолок всегда KLINE_RESPONSE_TIMEOUT_MS.
+static uint32_t g_poll_interval_ms = KLINE_POLL_INTERVAL_MS;
+static uint32_t g_poll_timeout_fast_ms = KLINE_POLL_TIMEOUT_FAST_MS;
+
 static uint32_t kline_poll_timeout_ms(void) {
-  return (g_current_baud >= 38400) ? KLINE_POLL_TIMEOUT_FAST_MS
+  return (g_current_baud >= 38400) ? g_poll_timeout_fast_ms
                                    : KLINE_RESPONSE_TIMEOUT_MS;
+}
+
+// Получить/подстроить тайминг из UI. param: 0=период опроса, 1=потолок
+// ответа. Границы 20..500мс.
+int kline_timing_get(int param) {
+  if (param == 0) return (int)g_poll_interval_ms;
+  if (param == 1) return (int)g_poll_timeout_fast_ms;
+  return 0;
+}
+void kline_timing_adjust(int param, int delta) {
+  uint32_t *p = (param == 0) ? &g_poll_interval_ms
+              : (param == 1) ? &g_poll_timeout_fast_ms
+                             : NULL;
+  if (!p) return;
+  int v = (int)*p + delta;
+  if (v < 20) v = 20;
+  if (v > 500) v = 500;
+  *p = (uint32_t)v;
 }
 
 // Кадры и контрольные суммы — из задокументированного рабочего кода для
 // Январь 7.2 (формат KWP2000, адрес ЭБУ 0x10, адрес тестера 0xF1).
 static const uint8_t kStopComm[] = {0x81, 0x10, 0xF1, 0x82, 0x04};
 static const uint8_t kStartComm[] = {0x81, 0x10, 0xF1, 0x81, 0x03};
-static const uint8_t kReadData[] = {0x82, 0x10, 0xF1, 0x21, 0x01, 0xA5};
+// Основной опрос — «жирный» кадр LID 0x0F, как ИОН (сниффер подтвердил:
+// это ЕДИНСТВЕННЫЙ циклический запрос ИОН). В одном кадре: обороты, ОЖ,
+// дроссель, скорость, ДАД(давление), воздух, наполнение, GBC. Напряжения
+// и коррекций в нём НЕТ — их читаем редким SID 0x23. Ответ = эхо(6) +
+// [80 F1 10 35 61 0F <51 данных> cs] = 64 байта.
+static const uint8_t kReadData[] = {0x82, 0x10, 0xF1, 0x21, 0x0F, 0xB3};
+#define KLINE_POLL_FRAME_LEN 64 // полный кадр ответа на 21 0F (эхо+ответ)
 
 // ReadMemoryByAddress (SID 0x23) — читает произвольный адрес XDATA, чего
 // нет в штатном readData. Разбор дампа J5TRS251 (2026-09-18): диспетчер
@@ -209,12 +254,28 @@ typedef struct {
   uint8_t hi, lo, len;
   uint8_t kind; // 0 = ДТВ (воздух); 1 = блок 0xF99C..F99E (корр+темп заряда)
 } kline_ext_read_t;
-static const kline_ext_read_t kExtReads[] = {
-    {0xF8, 0x85, 1, 0}, // температура воздуха (ДТВ)
-    {0xF9, 0x9C, 3, 1}, // корр.ОЖ (F99C), корр.заряд (F99D), темп.заряда (F99E)
+// АБС.ДАВЛЕНИЕ как в ИОН (подтверждено сниффером, tools/ion-sniffer):
+// сырой АЦП ДАД F80C(hi):F80D(lo) -> кПа по калибровке ~1-бар (105 кПа на
+// полную шкалу АЦП 1023). Теперь ДАД приходит прямо в жирном кадре 0x0F
+// (resp[38]/resp[39]), отдельный запрос не нужен.
+#define KLINE_DAD_MUL 10500 // кПа_x100 = АЦП * 10500 / 1023 (полн.шкала 105 кПа)
+#define KLINE_DAD_DIV 1023  // подстроить по ИОН на холостом/бусте
+
+// Медленные доп.параметры (нет в кадре 0x0F) — читаем по кругу, редко.
+static const kline_ext_read_t kSlowReads[] = {
+    {0xF9, 0x78, 1, 4}, // напряжение (F978): В = 5.2 + raw*0.05
+    {0xF9, 0x9C, 3, 1}, // корр.ОЖ(F99C), корр.заряд(F99D), темп.заряда(F99E)
     {0xF9, 0x42, 1, 2}, // поправка ЦН (F942)
 };
-static int g_ext_index = 0;
+static int g_slow_index = 0;
+// Какой ext-запрос сейчас в полёте (для разбора ответа в EXT_WAIT).
+static kline_ext_read_t g_ext_cur = {0, 0, 0, 0};
+// Теперь всё «геройское» (обороты/давление/ОЖ/дроссель) приходит в одном
+// кадре 0x0F каждый опрос — как у ИОН. Медленные параметры (напряжение/
+// коррекции/поправка), которых в кадре нет, читаем по кругу редким SID
+// 0x23: раз в KLINE_SLOW_INTERVAL_MS крадём один опрос под один параметр.
+#define KLINE_SLOW_INTERVAL_MS 2000 // как часто — один медленный параметр
+static uint32_t g_last_slow_ms = 0;
 
 // Собирает кадр ReadMemoryByAddress для адреса hi:lo длиной len. out >= 9.
 static size_t kline_build_readmem(uint8_t hi, uint8_t lo, uint8_t len,
@@ -622,27 +683,29 @@ static void kline_speed_probe_report(const uint8_t *tx, size_t tx_len,
 // требуем ровно это, а не пытаемся спасти частичные данные.
 static bool kline_parse_read_data(const uint8_t *resp, size_t n,
                                    kline_data_t *out) {
-  if (n < 47 || resp[10] != 0x61) {
+  // Жирный кадр LID 0x0F: эхо(6)+[80 F1 10 35 61 0F <51 данных> cs].
+  // resp[10]=0x61 (позитив readData), resp[11]=0x0F (LID). Смещения полей
+  // подтверждены сниффером ИОН + таблицами прошивки (см. docs/KLINE.md,
+  // «СНИФФЕР ИОН»): данные кадра начинаются с resp[12].
+  if (n < KLINE_POLL_FRAME_LEN || resp[10] != 0x61 || resp[11] != 0x0F) {
     return false;
   }
   out->connected = true;
-  out->coolant_c = (int32_t)resp[20] - 40;
-  out->throttle_pct = resp[22];
-  out->rpm = (int32_t)resp[23] * 40;
-  out->speed_kmh = resp[29];
-  out->voltage = 5.2f + resp[30] * 0.05f;
-  // Ниже — НЕ подтверждено на этом ЭБУ, кандидаты из второго
-  // стороннего кода (см. docs/KLINE.md, таблица кандидатов). Байты те
-  // же, что и в остальном разборе (полный буфер, эхо включено).
-  out->ign_deg = ((int32_t)resp[28] * 10 / 2) / 10;
-  out->boost_raw = (int32_t)resp[34] | ((int32_t)resp[35] << 8);
-  // Цикловое наполнение (GBC) — XDATA 0xF808, лежит в readData [36]-[37]
-  // (16-бит, младший байт первым, как у MAP).
-  out->gbc = (int32_t)resp[36] | ((int32_t)resp[37] << 8);
-  // Параметры, читаемые отдельной командой (SID 0x23) — подмешиваем
-  // последние кэшированные значения, чтобы readData их не сбрасывал.
-  out->air_temp_c = g_air_temp_c;
-  out->air_temp_valid = g_air_temp_valid;
+  out->coolant_c = (int32_t)resp[20] - 40;   // RAM 0x49 (data[8])
+  out->throttle_pct = resp[23];              // RAM 0x52 (data[11])
+  out->rpm = (int32_t)resp[24] * 40;         // RAM 0x55 (data[12])
+  out->speed_kmh = resp[47];                 // F90A     (data[35])
+  // ДАД АЦП F80C(hi):F80D(lo) big-endian -> абс.давление кПа×100.
+  uint16_t adc = ((uint16_t)resp[38] << 8) | resp[39];
+  out->map_kpa_x100 = (int32_t)adc * KLINE_DAD_MUL / KLINE_DAD_DIV;
+  out->map_valid = true;
+  out->air_temp_c = (int32_t)resp[49] - 40;  // F885 (data[37])
+  out->air_temp_valid = true;
+  // Цикловое наполнение (GBC) — F808 (data[45-46]), младший байт первым.
+  out->gbc = (int32_t)resp[57] | ((int32_t)resp[58] << 8);
+  out->ign_deg = 0; // УОЗ в кадр 0x0F не входит; ИОН его считает из прошивки
+  // Напряжение и коррекции — из кэша редких SID 0x23 (их нет в кадре 0x0F).
+  out->voltage = g_voltage;
   out->corr_cn = g_corr_cn;
   out->corr_coolant = g_corr_coolant;
   out->corr_charge = g_corr_charge;
@@ -668,11 +731,9 @@ typedef enum {
   KLINE_ST_EXT_WAIT,           // ReadMemoryByAddress (SID 0x23) отправлен
 } kline_state_t;
 
-// Доп. параметры (SID 0x23) читаются по очереди, не каждый цикл — они
-// меняются медленно. Кэшируем и подмешиваем в каждый kline_data_set
-// (иначе readData затирал бы их). Переменные объявлены выше (рядом с
-// g_current_baud) — нужны в kline_parse_read_data, определённом раньше.
-#define KLINE_AIRTEMP_INTERVAL_MS 1000
+// Доп. параметры (SID 0x23) кэшируются и подмешиваются в каждый
+// kline_data_set (иначе readData затирал бы их). Переменные и расписание
+// чтений (kMapRead/kSlowReads, KLINE_MAP_INTERVAL_MS/…) объявлены выше.
 
 // Минимальная пауза между ответом ЭБУ и следующим запросом тестера
 // (похоже на P3min из KWP2000). В блокирующей версии эта пауза возникала
@@ -686,7 +747,7 @@ typedef enum {
 
 static kline_state_t g_state = KLINE_ST_IDLE;
 static uint32_t g_state_started_ms = 0;
-static uint8_t g_buf[64];
+static uint8_t g_buf[96]; // кадр 0x0F = 64 б; с запасом на хвосты/шум
 static size_t g_buf_n = 0;
 
 // СКАН СКОРОСТЕЙ (2026-09-17) — по уточнённому плану пользователя после
@@ -877,7 +938,7 @@ static bool kline_do_real_switch(uint32_t target_baud, const uint8_t *cmd) {
   // 0) StopDiagnosticSession (SID 0x20) — сбрасывает бит 0x7E, который
   //    взвёл наш readData/OltPin. Без этого смена скорости отвечает
   //    "ошибка сессии" 7F 10 10. После этого НЕ шлём readData до смены!
-  uint8_t buf[48];
+  uint8_t buf[96]; // вмещает жирный кадр 0x0F (64 б) при верификации скорости
   size_t n = 0;
   uint32_t start;
   delay(KLINE_INTER_MSG_GAP_MS);
@@ -937,9 +998,9 @@ static bool kline_do_real_switch(uint32_t target_baud, const uint8_t *cmd) {
   for (size_t i = 0; i < n; i++) Serial.printf(" %02X", buf[i]);
   Serial.println();
 
-  bool ok = (n >= 47 && buf[10] == 0x61);
+  bool ok = (n >= KLINE_POLL_FRAME_LEN && buf[10] == 0x61 && buf[11] == 0x0F);
   Serial.printf("  -> %s\n", ok ? "SUCCESS!!! связь на новой скорости"
-                                 : "нет валидного ответа (0x61)");
+                                 : "нет валидного ответа (0x61 0F)");
   return ok;
 }
 
@@ -1069,16 +1130,23 @@ void kline_test_poll(uint32_t now_ms) {
       g_state_started_ms = now_ms;
       g_state = KLINE_ST_PROBE_GAP;
     } else if (g_connected) {
-      if (now_ms - g_last_poll_ms < KLINE_POLL_INTERVAL_MS) {
+      if (now_ms - g_last_poll_ms < g_poll_interval_ms) {
         return;
       }
       g_last_poll_ms = now_ms;
-      // Раз в KLINE_AIRTEMP_INTERVAL_MS вместо обычного readData читаем
-      // ОДИН доп. параметр из kExtReads (SID 0x23), по кругу — они
-      // меняются медленно, пропуск одного readData раз в секунду незаметен.
-      if (now_ms - g_last_airtemp_ms >= KLINE_AIRTEMP_INTERVAL_MS) {
-        g_last_airtemp_ms = now_ms;
-        const kline_ext_read_t *er = &kExtReads[g_ext_index];
+      // Основной опрос — жирный кадр 0x0F (обороты/ОЖ/дроссель/скорость/
+      // давление/воздух/GBC) каждый цикл, как ИОН. Раз в KLINE_SLOW_INTERVAL_MS
+      // вместо кадра шлём один медленный SID 0x23 (напряжение/коррекции/
+      // поправка — их в кадре 0x0F нет).
+      const kline_ext_read_t *er = NULL;
+      if (now_ms - g_last_slow_ms >= KLINE_SLOW_INTERVAL_MS) {
+        g_last_slow_ms = now_ms;
+        er = &kSlowReads[g_slow_index];
+        g_slow_index = (g_slow_index + 1) %
+                       (int)(sizeof(kSlowReads) / sizeof(kSlowReads[0]));
+      }
+      if (er) {
+        g_ext_cur = *er;
         uint8_t frame[9];
         kline_build_readmem(er->hi, er->lo, er->len, frame);
         kline_send_only(frame, sizeof(frame));
@@ -1098,10 +1166,10 @@ void kline_test_poll(uint32_t now_ms) {
       // Свежее подключение всегда начинается на 10400, даже если до
       // обрыва связи мы успели переключиться на 38400.
       g_fast_active = false;
-      g_air_temp_valid = false; // не показываем устаревшую температуру
       g_ext_valid = false;
-      g_ext_index = 0;
-      g_last_airtemp_ms = 0;    // прочитать доп. параметры сразу после коннекта
+      g_slow_index = 0;
+      g_poll_miss = 0;
+      g_last_slow_ms = 0; // прочитать доп. параметры сразу после коннекта
 #if KLINE_AUTO_FAST
       // ВОССТАНОВЛЕНИЕ ПОСЛЕ "ЭБУ завис на 38400" (2026-09-18) — РЕДКОЕ,
       // не перед каждой попыткой! Если бы мы слали 38400-мусор перед
@@ -1180,7 +1248,8 @@ void kline_test_poll(uint32_t now_ms) {
 
   case KLINE_ST_CONNECT_WAIT_READ: {
     kline_collect_available(g_buf, &g_buf_n, sizeof(g_buf));
-    if (g_buf_n < 47 && (now_ms - g_state_started_ms) < KLINE_RESPONSE_TIMEOUT_MS) {
+    if (g_buf_n < KLINE_POLL_FRAME_LEN &&
+        (now_ms - g_state_started_ms) < KLINE_RESPONSE_TIMEOUT_MS) {
       return;
     }
     kline_analyze_raw(g_buf, g_buf_n);
@@ -1221,20 +1290,47 @@ void kline_test_poll(uint32_t now_ms) {
 
   case KLINE_ST_POLL_WAIT_READ: {
     kline_collect_available(g_buf, &g_buf_n, sizeof(g_buf));
-    if (g_buf_n < 47 && (now_ms - g_state_started_ms) < kline_poll_timeout_ms()) {
+    if (g_buf_n < KLINE_POLL_FRAME_LEN &&
+        (now_ms - g_state_started_ms) < kline_poll_timeout_ms()) {
       return;
     }
-    kline_analyze_raw(g_buf, g_buf_n);
     kline_data_t kd = {0};
     if (kline_parse_read_data(g_buf, g_buf_n, &kd)) {
+      g_poll_miss = 0;
       kline_data_set(&kd);
+      // Компактный лог для подгонки ~раз в секунду — все живые величины
+      // в одну строку, удобно сверять с ИОН (raw = сырой байт readData).
+      static uint32_t last_tune = 0;
+      if (now_ms - last_tune >= 1000) {
+        last_tune = now_ms;
+        int v100 = (int)(kd.voltage * 100 + 0.5f);
+        Serial.printf(
+            "[TUNE] RPM=%ld дрос=%ld%%(r%u) ОЖ=%ldC(r%u) V=%d.%02d "
+            "MAP=%ld.%02ld кПа возд=%ldC GBC=%ld попрЦН=%ld коррОЖ=%ld коррЗ=%ld\n",
+            (long)kd.rpm, (long)kd.throttle_pct, g_buf[23], (long)kd.coolant_c,
+            g_buf[20], v100 / 100, v100 % 100, (long)(kd.map_kpa_x100 / 100),
+            (long)(kd.map_kpa_x100 % 100), (long)kd.air_temp_c, (long)kd.gbc,
+            (long)kd.corr_cn, (long)kd.corr_coolant, (long)kd.corr_charge);
+      }
     } else {
-      g_connected = false;
-      kline_data_t empty = {0};
-      kline_data_set(&empty);
-      kline_set_status("K-Line: потеряна связь, переподключаюсь",
-                                     false);
-      g_last_connect_attempt_ms = now_ms;
+      // Промах опроса. Терпим несколько подряд (как ИОН) — одиночный промах
+      // от джиттера не должен рвать сессию и гнать полный реконнект со сменой
+      // скорости. Показания НЕ сбрасываем — держим последние.
+      if (++g_poll_miss < KLINE_POLL_MAX_MISS) {
+        static uint32_t last_miss_log = 0;
+        if (now_ms - last_miss_log >= 1000) {
+          last_miss_log = now_ms;
+          Serial.printf("[KL] промах опроса %u/%u (n=%u) — повтор\n",
+                        g_poll_miss, KLINE_POLL_MAX_MISS, (unsigned)g_buf_n);
+        }
+      } else {
+        g_connected = false;
+        g_poll_miss = 0;
+        kline_data_t empty = {0};
+        kline_data_set(&empty);
+        kline_set_status("K-Line: потеряна связь, переподключаюсь", false);
+        g_last_connect_attempt_ms = now_ms;
+      }
     }
     g_state = KLINE_ST_IDLE;
     break;
@@ -1242,9 +1338,11 @@ void kline_test_poll(uint32_t now_ms) {
 
   case KLINE_ST_EXT_WAIT: {
     kline_collect_available(g_buf, &g_buf_n, sizeof(g_buf));
-    const kline_ext_read_t *er = &kExtReads[g_ext_index];
-    // Ответ: 9 байт эха запроса + ответ ЭБУ (0x63 + len байт + чексумма).
-    size_t need = 9 + 3 + er->len; // эхо + [63 ..] с запасом
+    const kline_ext_read_t *er = &g_ext_cur;
+    // Полный ответ = эхо(9) + [80 F1 10 <len> 63 <данные...> <кс>] =
+    // 15 + er->len. Ждём именно столько, иначе выходили ровно на 0x63 и
+    // обрывали до данных (баг «нет 0x63»).
+    size_t need = 15 + er->len;
     if (g_buf_n < need && (now_ms - g_state_started_ms) < kline_poll_timeout_ms()) {
       return;
     }
@@ -1254,32 +1352,24 @@ void kline_test_poll(uint32_t now_ms) {
       if (g_buf[i] == 0x63) { d = (int)i + 1; break; }
     }
     if (d >= 0) {
-      if (er->kind == 0) {
-        // ДТВ: °C со смещением +40 (как ДТОЖ) — проверить по факту.
-        g_air_temp_c = (int32_t)g_buf[d] - 40;
-        g_air_temp_valid = true;
-        Serial.printf("[KL] ДТВ(F885): raw=%u -> %ld C\n", g_buf[d],
-                      (long)g_air_temp_c);
+      if (er->kind == 4) {
+        // Напряжение (F978): В = 5.2 + raw*0.05 (как было в LID 0x01).
+        g_voltage = 5.2f + g_buf[d] * 0.05f;
       } else if (er->kind == 1) {
         // Блок F99C..F99E: корр.ОЖ, корр.заряд, темп.заряда(+40).
         g_corr_coolant = g_buf[d];
         g_corr_charge = g_buf[d + 1];
         g_charge_temp_c = (int32_t)g_buf[d + 2] - 40;
         g_ext_valid = true;
-        Serial.printf("[KL] коррЦН ОЖ=%u заряд=%u Tзаряда=%ld C (raw)\n",
-                      g_buf[d], g_buf[d + 1], (long)g_charge_temp_c);
       } else if (er->kind == 2) {
         // Поправка ЦН (F942) — сырой байт, масштаб уточнить по факту.
         g_corr_cn = g_buf[d];
-        Serial.printf("[KL] поправка ЦН(F942): raw=%u\n", g_buf[d]);
       }
     } else {
       Serial.printf("[KL] SID23 kind=%u: нет 0x63, RX:", er->kind);
       for (size_t i = 0; i < g_buf_n; i++) Serial.printf(" %02X", g_buf[i]);
       Serial.println();
     }
-    // следующий доп. параметр в следующий слот
-    g_ext_index = (g_ext_index + 1) % (int)(sizeof(kExtReads) / sizeof(kExtReads[0]));
     g_state = KLINE_ST_IDLE;
     break;
   }
@@ -1384,4 +1474,5 @@ void kline_test_poll(uint32_t now_ms) {
 void kline_test_register(void) {
   kline_set_baud(KLINE_BAUD);
   screen_debug_set_kline_test_cb(kline_manual_test);
+  screen_debug_set_timing_cb(kline_timing_get, kline_timing_adjust);
 }
