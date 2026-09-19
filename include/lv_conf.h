@@ -110,6 +110,21 @@
  * - LV_OS_MQX
  * - LV_OS_SDL2
  * - LV_OS_CUSTOM */
+// ОТРИСОВКА НА ДВУХ ЯДРАХ — ГОТОВЫЙ РЕЗЕРВ СКОРОСТИ (2026-09-19).
+// У ESP32 второе ядро простаивает, а расчёт сглаженных дуг — самое дорогое,
+// что есть в этом интерфейсе (замер: около 2 мкс на пиксель). LVGL умеет
+// рендерить в несколько потоков, и тогда работа делится между ядрами.
+// Чтобы включить, поменять ДВЕ строки:
+//     LV_USE_OS                -> LV_OS_FREERTOS   (эта строка)
+//     LV_DRAW_SW_DRAW_UNIT_CNT -> 2                (ниже в этом файле)
+// ПРОБОВАЛИ, ОТКАТИЛИ (2026-09-19). Включали LV_OS_FREERTOS +
+// LV_DRAW_SW_DRAW_UNIT_CNT=2, чтобы отрисовка делилась между ядрами.
+// ЗАМЕР С ПЛАТЫ: худший вызов LVGL 53.9/53.4 мс на одном ядре против
+// 52.9/52.1 мс на двух — разница 2%, это шум. Причина понятна: LVGL
+// раздаёт по потокам ОТДЕЛЬНЫЕ задачи отрисовки, а одна дуга — это одна
+// задача, её невозможно поделить. Выигрыша нет, а лишний поток с высоким
+// приоритетом и 8 КБ стека — есть. Вернули как было.
+// Включать имеет смысл, только если в кадре появится МНОГО объектов сразу.
 #define LV_USE_OS   LV_OS_NONE
 
 #if LV_USE_OS == LV_OS_CUSTOM
@@ -129,7 +144,7 @@
  *========================*/
 
 /** Align stride of all layers and images to this bytes */
-#define LV_DRAW_BUF_STRIDE_ALIGN                1
+#define LV_DRAW_BUF_STRIDE_ALIGN                4
 
 /** Align start address of draw_buf addresses to this bytes*/
 #define LV_DRAW_BUF_ALIGN                       4
@@ -195,7 +210,7 @@
     /** Set number of draw units.
      *  - > 1 requires operating system to be enabled in `LV_USE_OS`.
      *  - > 1 means multiple threads will render the screen in parallel. */
-    #define LV_DRAW_SW_DRAW_UNIT_CNT    1
+    #define LV_DRAW_SW_DRAW_UNIT_CNT    1  /* см. заметку про два ядра выше */
 
     /** Use Arm-2D to accelerate software (sw) rendering. */
     #define LV_USE_DRAW_ARM2D_SYNC      0

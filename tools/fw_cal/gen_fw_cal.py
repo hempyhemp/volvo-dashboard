@@ -64,6 +64,9 @@ INI = os.path.join(ROOT, "firmware_cal.ini")
 OUT = os.path.join(ROOT, "include", "firmware_cal.h")
 
 BANNER = "=" * 70
+# Обратный слэш для переноса строки в макросе C (пишем через chr, чтобы не
+# путаться с экранированием в самом Python).
+BS2 = chr(92)
 
 
 def warn(msg):
@@ -127,6 +130,49 @@ def parse_firmware(path):
     return info
 
 
+# --------------------------------------------------------------------------
+# КАРТА СОСТАВА СМЕСИ прямо из прошивки.
+#
+# Найдена 2026-09-19 (docs/KLINE.md, «КАРТА СОСТАВА СМЕСИ НАЙДЕНА В ПРОШИВКЕ»):
+# 16x16 байт по смещению 0x76EF, построчно, AFR = (байт + 128) * 14.7 / 256.
+# Это НЕ угадано: масштаб вычислен из выгрузки ЧипТюнерPRO (все 14 уникальных
+# значений дают целые), а место подтверждено тем, что чужой тюнинг из
+# 2volvo.bin отличается от нашей прошивки ровно внутри этой карты.
+#
+# Смещение и формула лежат в firmware_cal.ini — если прошивка сменится и
+# карта переедет, правится там же, а не в коде.
+def read_afr_map(blob, cfg):
+    off = gets(cfg, "afr_map", "offset", "")
+    if not off:
+        return None, "смещение карты не задано"
+    try:
+        off = int(off, 0)
+    except ValueError:
+        return None, "смещение карты не разобрано: %s" % off
+    rows = geti(cfg, "afr_map", "rows", 16)
+    cols = geti(cfg, "afr_map", "cols", 16)
+    bias = geti(cfg, "afr_map", "bias", 128)
+    full = getf(cfg, "afr_map", "afr_full", 14.7)
+    n = rows * cols
+    if off < 0 or off + n > len(blob):
+        return None, "карта не помещается в файл"
+    grid = []
+    for r in range(rows):
+        line = []
+        for c in range(cols):
+            b = blob[off + r * cols + c]
+            line.append((b + bias) * full / 256.0)
+        grid.append(line)
+    flat = [v for line in grid for v in line]
+    lo, hi = min(flat), max(flat)
+    # Проверка на вменяемость: состав смеси бензинового мотора обязан лежать
+    # в 9..16. Если нет — значит смещение уехало, и молча выдавать мусор за
+    # калибровку нельзя.
+    if lo < 9.0 or hi > 16.0:
+        return None, "значения вне 9..16 (%.2f..%.2f) — смещение не то" % (lo, hi)
+    return grid, "%.2f..%.2f" % (lo, hi)
+
+
 def read_ini():
     cfg = configparser.ConfigParser()
     if os.path.exists(INI):
@@ -187,6 +233,11 @@ def generate():
     afr = getf(cfg, "fuel", "afr_stoich", 14.7)
     cyls = info["cylinders"] or geti(cfg, "engine", "cylinders", 4)
 
+    grid, map_note = (None, "прошивка не читалась")
+    if found:
+        with open(fw_path, "rb") as f:
+            grid, map_note = read_afr_map(f.read(), cfg)
+
     if not matches:
         if found and declared:
             warn("[fw_cal] !!! ПРОШИВКА НЕ ТА, ПОД КОТОРУЮ СНЯТЫ КАЛИБРОВКИ !!!\n"
@@ -235,6 +286,53 @@ def generate():
     a('#define FWCAL_CYL_VOLUME_CM3    %d' % cyl_vol)
     a('#define FWCAL_DISP_CM3          %d' % (cyl_vol * cyls))
     a('#define FWCAL_AFR_STOICH_X100   %d' % int(round(afr * 100)))
+    def axis(key, n):
+        raw = gets(cfg, "afr_map", key, "")
+        if not raw:
+            return None
+        try:
+            vals = [float(x.strip().replace(",", ".")) for x in raw.split(",") if x.strip()]
+        except ValueError:
+            return None
+        return vals if len(vals) == n else None
+
+    rpm_axis = axis("rpm_axis", len(grid[0])) if grid else None
+    kpa_axis = axis("kpa_axis", len(grid)) if grid else None
+
+    a("")
+    a("// --- КАРТА СОСТАВА СМЕСИ, прочитана ИЗ САМОЙ ПРОШИВКИ ---")
+    if grid:
+        a("// Горизонталь (столбцы) — обороты коленвала, вертикаль (строки) —")
+        a("// абсолютное давление. Значения: AFR x100.")
+        a("// ВНИМАНИЕ: точки разбивки осей пока НЕ известны, поэтому")
+        a("// индексировать карту ещё нечем — см. docs/KLINE.md.")
+        a('#define FWCAL_AFR_MAP_OK   1')
+        a('#define FWCAL_AFR_MAP_ROWS %d' % len(grid))
+        a('#define FWCAL_AFR_MAP_COLS %d' % len(grid[0]))
+        a('#define FWCAL_AFR_MAP_X100 { ' + BS2)
+        for i, line in enumerate(grid):
+            tail = "" if i == len(grid) - 1 else ","
+            a('  {%s}%s ' % (", ".join("%d" % round(v * 100) for v in line), tail) + BS2)
+        a('}')
+        # Оси в .bin не нашлись (см. firmware_cal.ini) — берём из ini.
+        if rpm_axis:
+            a('#define FWCAL_AFR_MAP_RPM_OK 1')
+            a('#define FWCAL_AFR_MAP_RPM { %s }'
+              % ", ".join("%d" % round(v) for v in rpm_axis))
+        else:
+            a('#define FWCAL_AFR_MAP_RPM_OK 0')
+        if kpa_axis:
+            a('#define FWCAL_AFR_MAP_KPA_OK 1')
+            a('// Ось давления, кПа x100')
+            a('#define FWCAL_AFR_MAP_KPA_X100 { %s }'
+              % ", ".join("%d" % round(v * 100) for v in kpa_axis))
+        else:
+            a('// Ось давления НЕ ЗАДАНА -> карту индексировать нечем,')
+            a('// расход считается прежней прямой по двум точкам.')
+            a('#define FWCAL_AFR_MAP_KPA_OK 0')
+    else:
+        a("// Карта не прочитана: %s" % map_note)
+        a('#define FWCAL_AFR_MAP_OK   0')
     a("")
     a("#endif // FIRMWARE_CAL_H")
     text = "\n".join(lines) + "\n"
@@ -250,6 +348,11 @@ def generate():
         with open(OUT, "w", encoding="utf-8") as f:
             f.write(text)
 
+    print("[fw_cal] оси карты: обороты=%s, давление=%s"
+          % ("есть" if rpm_axis else "НЕТ", "есть" if kpa_axis else "НЕТ"))
+    print("[fw_cal] карта состава смеси: %s"
+          % ("%dx%d, AFR %s" % (len(grid), len(grid[0]), map_note) if grid
+             else "НЕ ПРОЧИТАНА (%s)" % map_note))
     print("[fw_cal] %s: %s %s  цил=%d  sha=%s  калибровки=%s"
           % (info["file"], info["name"] or "?", info["date"] or "?",
              cyls, info["sha256"][:12] or "?",

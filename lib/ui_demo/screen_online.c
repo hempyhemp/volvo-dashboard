@@ -10,7 +10,7 @@
 //
 // На реальном железе (сборка с ARDUINO) — только настоящие данные с
 // K-Line: RPM/COOLANT/VOLT показываются, когда kline_data.connected,
-// иначе "--"; остальные параметры (BOOST/AIR_T/OIL_P/OIL_T/IGN) — байты
+// иначе "--"; остальные параметры (BOOST/AIR_T/OIL_P/POWER/IGN) — байты
 // для них ещё не найдены (см. docs/KLINE.md), поэтому всегда "--".
 // Никогда не подставляем случайные цифры вместо реальных показаний —
 // на приборке это выглядело бы как настоящая телеметрия.
@@ -38,10 +38,19 @@ typedef struct {
   const char *unit;
   bool scale10;  // true → реальное значение = current/10 (1 знак после точки)
   bool scale100; // true → реальное значение = current/100 (2 знака, для буста)
+  // --- очередь перерисовки дуг (см. arcs_pump) ---
+  // ДОБАВЛЯТЬ ТОЛЬКО В КОНЕЦ: params[...] ниже заполняются ПОЗИЦИОННЫМИ
+  // инициализаторами, и любое поле, вставленное в середину, молча сдвинет
+  // все значения (строка единиц измерения уехала бы в числовое поле).
+  int32_t pending;       // значение, которое ещё не отдано дуге
+  bool dirty;            // true = дуга ждёт перерисовки
+  int32_t shown;         // что реально стоит на дуге сейчас
 } param_t;
 
 #define PARAM_COUNT 8
-enum { P_BOOST, P_RPM, P_AIR_T, P_COOLANT, P_VOLT, P_OIL_P, P_OIL_T, P_IGN };
+// P_POWER занял место бывшего OIL_T: температуры масла у Января нет и
+// не будет (нет такого входа), а мощность считается из расхода воздуха.
+enum { P_BOOST, P_RPM, P_AIR_T, P_COOLANT, P_VOLT, P_OIL_P, P_POWER, P_IGN };
 
 // Атмосферное давление — точка отсчёта манометрического давления наддува.
 // БОЛЬШЕ НЕ КОНСТАНТА: kline_test.cpp запоминает реальное показание ДАД на
@@ -67,21 +76,22 @@ static void format_value(param_t *p, char *buf, size_t buf_size) {
   }
 }
 
-static void anim_arc_exec_cb(void *var, int32_t v) {
-  lv_arc_set_value((lv_obj_t *)var, v);
-}
-
 static void apply_new_value(param_t *p, int32_t new_value) {
   switch (p->kind) {
     case KIND_ARC: {
-      lv_anim_t a;
-      lv_anim_init(&a);
-      lv_anim_set_var(&a, p->widget);
-      lv_anim_set_values(&a, p->current, new_value);
-      lv_anim_set_duration(&a, 200);
-      lv_anim_set_exec_cb(&a, anim_arc_exec_cb);
-      lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
-      lv_anim_start(&a);
+      // Дугу здесь НЕ трогаем — только ставим в очередь. Перерисовку
+      // разносит по времени arcs_pump() ниже, по одной дуге за такт.
+      //
+      // Почему так (замеры 2026-09-19). Сначала убрали анимацию — помогло,
+      // но всплески LVGL остались 55..70 мс. Счётчики вывода показали, что
+      // в дисплей уходит всего около 30 тыс. пикселей в секунду и лишь 10 мс
+      // на это тратится, то есть шина и DMA ни при чём. Считается: три дуги
+      // вместе занимают около 28 500 пикселей, и они перерисовывались ОДНИМ
+      // куском — отсюда и десятки миллисекунд в одном вызове. Отрисовка
+      // сглаженной дуги стоит примерно 2 мкс на пиксель, и это не лечится
+      // настройками, только уменьшением площади за раз.
+      p->pending = new_value;
+      p->dirty = true;
       break;
     }
     case KIND_LABEL:
@@ -94,6 +104,40 @@ static void apply_new_value(param_t *p, int32_t new_value) {
   char buf[24];
   format_value(p, buf, sizeof(buf));
   lv_label_set_text(p->value_label, buf);
+}
+
+// Разносим перерисовку дуг по времени: за один такт обновляем НЕ БОЛЬШЕ
+// ОДНОЙ дуги. Раньше все три перерисовывались в одном вызове — получался
+// один провал на 55..70 мс, который глаз видит как рывок. По одной дуге за
+// такт тот же объём работы разбивается на три коротких куска.
+//
+// Плюс мёртвая зона: дуга рисует 270 градусов на весь диапазон, поэтому
+// изменение, которое не сдвигает её даже на градус, перерисовывать незачем.
+// На холостых обороты постоянно дрожат (1120/1200/1680), и без этого дуга
+// дёргалась бы впустую.
+static void arcs_pump(void) {
+  static int next = 0;
+  for (int i = 0; i < PARAM_COUNT; i++) {
+    param_t *p = &params[(next + i) % PARAM_COUNT];
+    if (p->kind != KIND_ARC || !p->widget || !p->dirty) continue;
+    int32_t span = p->max - p->min;
+    if (span <= 0) span = 1;
+    int32_t moved = (p->pending - p->shown) * 270 / span;
+    if (moved < 0) moved = -moved;
+    p->dirty = false;
+    // Порог 3 градуса из 270, то есть около 1% шкалы — на глаз незаметно.
+    // Замер с платы показал, почему 1 градуса мало: у дуги БУСТА диапазон
+    // 300 сотых бара на 270 градусов, то есть один градус = 1.1 кПа, а
+    // давление постоянно дрожит на ±1 кПа (F80C скачет 41/42/43). Дуга
+    // перерисовывалась почти каждый такт впустую, по ~50 мс за раз.
+    // Накопление не теряется: pending обновляется каждый такт, и как только
+    // расхождение перевалит порог — дуга перерисуется.
+    if (moved < 3) continue;
+    lv_arc_set_value(p->widget, p->pending);
+    p->shown = p->pending;
+    next = (next + i + 1) % PARAM_COUNT;
+    return;                              // ровно одна дуга за такт
+  }
 }
 
 static void show_dash(param_t *p) {
@@ -118,6 +162,12 @@ static void show_volt(param_t *p, bool connected, float voltage) {
   lv_label_set_text(p->value_label, buf);
 }
 
+// Корень вкладки. Таймеры LVGL тикают независимо от того, какая вкладка
+// открыта, поэтому без этой проверки невидимый экран всё равно дёргал бы
+// kline_data_get, переписывал подписи и ЗАПУСКАЛ АНИМАЦИИ дуг — самая
+// дорогая отрисовка в проекте, и всё впустую (оптимизация 2026-09-19).
+static lv_obj_t *s_tab_root = NULL;
+
 #ifdef ARDUINO
 // Реальное железо: показываем только то, что реально знаем с K-Line.
 // Никогда не подставляем случайные "правдоподобные" цифры вместо
@@ -125,9 +175,11 @@ static void show_volt(param_t *p, bool connected, float voltage) {
 // показания. RPM/COOLANT/VOLT — подтверждены. IGN и BOOST — байты
 // НЕ подтверждены (кандидаты из стороннего кода, см. docs/KLINE.md),
 // но уже подключены по просьбе пользователя для проверки на месте;
-// формулы/масштаб могут поменяться. AIR_T/OIL_P/OIL_T — байтов ещё нет
+// формулы/масштаб могут поменяться. OIL_P — байтов нет и не будет
 // вообще, всегда "--".
 static void update_timer_cb(lv_timer_t *timer) {
+  if (s_tab_root && !lv_obj_is_visible(s_tab_root)) return;
+  arcs_pump();
   (void)timer;
 
   kline_data_t kd;
@@ -157,12 +209,20 @@ static void update_timer_cb(lv_timer_t *timer) {
     } else {
       show_dash(&params[P_AIR_T]);
     }
+    // МОЩНОСТЬ — оценка текущей отдачи по расходу воздуха. Пока мотор не
+    // крутится, воздуха нет и показывать нечего.
+    if (kd.rpm > 0) {
+      apply_new_value(&params[P_POWER], kd.power_hp);
+    } else {
+      show_dash(&params[P_POWER]);
+    }
   } else {
     show_dash(&params[P_RPM]);
     show_dash(&params[P_COOLANT]);
     show_dash(&params[P_IGN]);
     show_dash(&params[P_BOOST]);
     show_dash(&params[P_AIR_T]);
+    show_dash(&params[P_POWER]);
   }
   show_volt(&params[P_VOLT], kd.connected, kd.voltage);
 }
@@ -171,6 +231,8 @@ static void update_timer_cb(lv_timer_t *timer) {
 // моковое случайное блуждание по всем параметрам, как и раньше, для
 // разработки/просмотра интерфейса без платы.
 static void update_timer_cb(lv_timer_t *timer) {
+  if (s_tab_root && !lv_obj_is_visible(s_tab_root)) return;
+  arcs_pump();
   (void)timer;
 
   for (int i = 0; i < PARAM_COUNT; i++) {
@@ -194,6 +256,9 @@ static void make_arc(param_t *p, lv_obj_t *parent, lv_coord_t x, lv_coord_t y,
   lv_arc_set_bg_angles(arc, 0, 270);
   lv_arc_set_range(arc, p->min, p->max);
   lv_arc_set_value(arc, p->current);
+  p->shown = p->current;   // что реально стоит на дуге (для мёртвой зоны)
+  p->pending = p->current;
+  p->dirty = false;
   lv_obj_set_size(arc, size, size);
   lv_obj_set_pos(arc, x, y);
 
@@ -236,6 +301,7 @@ static void make_label(param_t *p, lv_obj_t *parent, const char *name,
 }
 
 void screen_online_create(lv_obj_t *parent) {
+  s_tab_root = parent;
   lv_obj_set_style_pad_all(parent, 0, 0);
 
   // Фон — фото котика, временно закомментировано, вернули градиент (см.
@@ -273,7 +339,7 @@ void screen_online_create(lv_obj_t *parent) {
   params[P_COOLANT] = (param_t){KIND_LABEL, NULL, NULL, 88, 60, 115, 2, "C", false};
   params[P_VOLT] = (param_t){KIND_LABEL, NULL, NULL, 138, 110, 148, 2, "V", true};
   params[P_OIL_P] = (param_t){KIND_LABEL, NULL, NULL, 28, 5, 60, 3, "bar", true};
-  params[P_OIL_T] = (param_t){KIND_LABEL, NULL, NULL, 95, 60, 140, 2, "C", false};
+  params[P_POWER] = (param_t){KIND_LABEL, NULL, NULL, 0, 0, 400, 5, "", false};
   params[P_IGN] = (param_t){KIND_LABEL, NULL, NULL, 12, -5, 35, 3, "deg", false};
 
   // --- Главный параметр: BOOST, дуга по центру ---
@@ -303,8 +369,8 @@ void screen_online_create(lv_obj_t *parent) {
                    0, 2);
 
   // --- Третьестепенные: просто числа, в ряд внизу ---
-  const char *tertiary_names[] = {"WATER", "VOLT", "OIL P", "OIL T", "IGN"};
-  int tertiary_idx[] = {P_COOLANT, P_VOLT, P_OIL_P, P_OIL_T, P_IGN};
+  const char *tertiary_names[] = {"WATER", "VOLT", "OIL P", "POWER hp", "IGN"};
+  int tertiary_idx[] = {P_COOLANT, P_VOLT, P_OIL_P, P_POWER, P_IGN};
   lv_coord_t col_w = 64;
   for (int i = 0; i < 5; i++) {
     make_label(&params[tertiary_idx[i]], parent, tertiary_names[i],
@@ -326,5 +392,9 @@ void screen_online_create(lv_obj_t *parent) {
   }
 #endif
 
-  lv_timer_create(update_timer_cb, 700, NULL);
+  // 120 мс: за такт перерисовывается максимум ОДНА дуга (см. arcs_pump),
+  // поэтому частый такт не страшен — он не складывает работу в один кусок,
+  // а наоборот размазывает её. Каждая дуга при этом обновляется примерно
+  // раз в треть секунды, что для приборки более чем живо.
+  lv_timer_create(update_timer_cb, 120, NULL);
 }

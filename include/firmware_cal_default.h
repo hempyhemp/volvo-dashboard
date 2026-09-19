@@ -74,4 +74,15 @@
 #define FWCAL_AFR_STOICH_X100 1470
 #endif
 
+// Карта состава смеси читается ИЗ ПРОШИВКИ генератором. Без него карты нет.
+#ifndef FWCAL_AFR_MAP_OK
+#define FWCAL_AFR_MAP_OK 0
+#endif
+#ifndef FWCAL_AFR_MAP_RPM_OK
+#define FWCAL_AFR_MAP_RPM_OK 0
+#endif
+#ifndef FWCAL_AFR_MAP_KPA_OK
+#define FWCAL_AFR_MAP_KPA_OK 0
+#endif
+
 #endif // FIRMWARE_CAL_DEFAULT_H

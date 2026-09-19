@@ -79,7 +79,14 @@ static void set_x10(tile_t *t, bool ok, long v_x10, const char *suffix) {
   lv_label_set_text(t->value, buf);
 }
 
+// Корень вкладки. Таймеры LVGL тикают независимо от того, какая вкладка
+// открыта, поэтому без этой проверки экран, которого не видно, всё равно
+// дёргал бы kline_data_get и переписывал подписи — впустую. Проверяем
+// видимость и выходим сразу (оптимизация отзывчивости 2026-09-19).
+static lv_obj_t *s_tab_root = NULL;
+
 static void update_cb(lv_timer_t *timer) {
+  if (s_tab_root && !lv_obj_is_visible(s_tab_root)) return;
   (void)timer;
   kline_data_t kd;
   kline_data_get(&kd);
@@ -100,6 +107,7 @@ static void update_cb(lv_timer_t *timer) {
 }
 
 void screen_engine_create(lv_obj_t *parent) {
+  s_tab_root = parent;
   lv_obj_set_style_bg_color(parent, lv_color_hex(0x0A0A0E), 0);
   lv_obj_set_style_bg_opa(parent, LV_OPA_COVER, 0);
   lv_obj_set_style_pad_all(parent, 0, 0);

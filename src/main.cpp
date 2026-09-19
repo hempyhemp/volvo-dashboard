@@ -16,6 +16,7 @@
 #include <TFT_eSPI.h>
 #include <XPT2046_Touchscreen.h>
 #include <lvgl.h>
+#include <esp_heap_caps.h>
 #include "ui_demo.h"
 #include "kline_test.h"
 
@@ -40,22 +41,74 @@ XPT2046_Touchscreen touchscreen(TOUCH_CS_PIN, TOUCH_IRQ);
 
 static lv_display_t *lv_disp;
 
-// Буфер отрисовки — не весь экран целиком, а часть (по строкам),
-// так экономим RAM. 320 (ширина) * 20 строк * 2 байта (RGB565) = 12800 байт.
-static const uint32_t LVGL_BUF_LINES = 20;
-static lv_color_t draw_buf[320 * LVGL_BUF_LINES];
+// Буферы отрисовки. Было: ОДИН буфер на 20 строк (12800 б) и вывод через
+// блокирующий pushColors — процессор сам пропихивал каждый пиксель в SPI и
+// всё это время не мог рисовать следующий кусок.
+//
+// Стало (2026-09-19, оптимизация отзывчивости):
+//   * два буфера по 40 строк (320*40*2 = 25600 б каждый, 51200 б всего);
+//   * вывод через DMA.
+// Смысл двойного буфера именно в DMA: пока контроллер сам выпихивает в
+// экран буфер A, LVGL уже рисует в буфер B. Корректность держится на том,
+// что pushPixelsDMA НАЧИНАЕТ с dmaWait() — то есть следующая посылка ждёт
+// завершения предыдущей, а буфер A переиспользуется только через одну
+// посылку, когда его DMA гарантированно закончился.
+// Памяти на плате 320 КБ, занято около трети — запас есть.
+// Буферы берём ИЗ КУЧИ, а не статическим массивом: у ESP32 сегмент
+// статических данных (dram0_0_seg) заметно меньше общего объёма RAM, и два
+// буфера по 25 КБ в него уже не влезли (линковщик ругался на переполнение
+// на 42 КБ). В куче место есть. heap_caps_malloc с MALLOC_CAP_DMA гарантирует
+// память, пригодную для DMA.
+// Если запрошенный размер не выделился — спускаемся по списку, вплоть до
+// прежних 20 строк, чтобы прошивка стартовала в любом случае.
+static const uint32_t LVGL_TRY_LINES[] = {40, 32, 24, 20, 12};
+static lv_color_t *draw_buf1 = NULL;
+static lv_color_t *draw_buf2 = NULL;
+static size_t draw_buf_bytes = 0;
+
+static void alloc_draw_buffers(void) {
+  for (unsigned i = 0; i < sizeof(LVGL_TRY_LINES) / sizeof(LVGL_TRY_LINES[0]); i++) {
+    size_t b = 320 * LVGL_TRY_LINES[i] * sizeof(lv_color_t);
+    draw_buf1 = (lv_color_t *)heap_caps_malloc(b, MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    draw_buf2 = (lv_color_t *)heap_caps_malloc(b, MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    if (draw_buf1 && draw_buf2) {
+      draw_buf_bytes = b;
+      Serial.printf("[GFX] буферы отрисовки: 2 x %u строк (%u б), free heap %u\n",
+                    (unsigned)LVGL_TRY_LINES[i], (unsigned)b,
+                    (unsigned)ESP.getFreeHeap());
+      return;
+    }
+    if (draw_buf1) { heap_caps_free(draw_buf1); draw_buf1 = NULL; }
+    if (draw_buf2) { heap_caps_free(draw_buf2); draw_buf2 = NULL; }
+  }
+  Serial.println("[GFX] !!! не удалось выделить буферы отрисовки");
+}
 
 // LVGL зовёт эту функцию, когда нужно вывести на экран очередной
 // прямоугольный кусок картинки (area) из подготовленного буфера px_map.
+// Счётчики вывода — чтобы отделить «долго СЧИТАЕМ картинку» от «долго
+// ПИХАЕМ её в экран». Если пикселей за кадр мало, а LVGL всё равно занят
+// десятки миллисекунд, значит упираемся в расчёт (дуги), а не в шину.
+volatile uint32_t g_flush_calls = 0;
+volatile uint32_t g_flush_px = 0;
+volatile uint32_t g_flush_us = 0;
+
 void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {
   uint32_t w = area->x2 - area->x1 + 1;
   uint32_t h = area->y2 - area->y1 + 1;
+  uint32_t fus = micros();
+  g_flush_calls++;
+  g_flush_px += w * h;
 
   tft.startWrite();
   tft.setAddrWindow(area->x1, area->y1, w, h);
-  tft.pushColors((uint16_t *)px_map, w * h, true);
-  tft.endWrite();
-
+  // Асинхронно: ставим посылку в DMA и СРАЗУ отпускаем LVGL рисовать
+  // дальше во второй буфер. endWrite() тут звать НЕЛЬЗЯ — он дожидается
+  // DMA и весь смысл перекрытия пропадает. Шину дисплея больше никто не
+  // делит (тач сидит на отдельном SPI-периферале HSPI), поэтому держать
+  // транзакцию открытой безопасно.
+  tft.pushPixelsDMA((uint16_t *)px_map, w * h);
+  g_flush_us += micros() - fus;
   lv_display_flush_ready(disp);
 }
 
@@ -126,6 +179,13 @@ void printChipInfo() {
 }
 
 void setup() {
+  // Увеличенный буфер передачи Serial. По умолчанию он маленький, и наши
+  // отладочные строки ([TUNE]/[CAL]/[FRAME], около 450 байт раз в секунду)
+  // переполняли его: printf вставал и ЖДАЛ, пока байты уползут в порт на
+  // 115200 — это до 40 мс заморозки главного цикла каждую секунду, ровно
+  // тот «рывок», который видно на экране. С буфером на 4 КБ строки просто
+  // складываются и уходят фоном, цикл не стоит.
+  Serial.setTxBufferSize(4096);
   Serial.begin(115200);
   delay(1500);
 
@@ -149,6 +209,13 @@ void setup() {
   // цвета часто инвертированы: чёрный фон рисуется белым. Включаем инверсию.
   tft.invertDisplay(true);
 
+  // DMA для вывода в дисплей (см. lvgl_flush_cb). setSwapBytes(true) нужен
+  // потому, что LVGL отдаёт RGB565 в порядке байтов процессора, а дисплею
+  // нужен обратный — pushPixelsDMA сам переставит байты перед посылкой
+  // (раньше это делал третий аргумент pushColors).
+  tft.initDMA();
+  tft.setSwapBytes(true);
+
   // Serial.println("DISPLAY INITIALIZED");
   // Serial.print("  tft.width()  = ");
   // Serial.println(tft.width());
@@ -163,7 +230,8 @@ void setup() {
 
   lv_disp = lv_display_create(tft.width(), tft.height());
   lv_display_set_flush_cb(lv_disp, lvgl_flush_cb);
-  lv_display_set_buffers(lv_disp, draw_buf, NULL, sizeof(draw_buf),
+  alloc_draw_buffers();
+  lv_display_set_buffers(lv_disp, draw_buf1, draw_buf2, draw_buf_bytes,
                           LV_DISPLAY_RENDER_MODE_PARTIAL);
 
   lv_indev_t *touch_indev = lv_indev_create();
@@ -177,9 +245,21 @@ void setup() {
   // Serial.println("========================");
 }
 
+// Замер отзывчивости. Раз в 5 секунд печатает, сколько времени съедают
+// отрисовка и опрос ЭБУ и как часто прокручивается главный цикл. Нужен,
+// чтобы «подтормаживает» стало числом, а не ощущением. Выключается одной
+// строкой, если мешает.
+#define LOOP_PROFILING 1
+
 void loop() {
-  static unsigned long lastBeat = 0;
   static unsigned long lastTick = millis();
+#if LOOP_PROFILING
+  static uint32_t prof_last_ms = 0;
+  static bool prof_started = false;
+  static uint32_t prof_loops = 0;
+  static uint32_t prof_lv_total = 0, prof_lv_max = 0;
+  static uint32_t prof_kl_total = 0, prof_kl_max = 0;
+#endif
 
   unsigned long now = millis();
 
@@ -187,12 +267,62 @@ void loop() {
   // и давать ему время на перерисовку/обработку таймеров.
   lv_tick_inc(now - lastTick);
   lastTick = now;
+
+#if LOOP_PROFILING
+  uint32_t t0 = micros();
   lv_timer_handler();
-
+  uint32_t t1 = micros();
   kline_test_poll(now);
+  uint32_t t2 = micros();
 
-  if (now - lastBeat >= 3000) {
-    lastBeat = now;
-    // Serial.println("...alive...");
+  uint32_t dlv = t1 - t0, dkl = t2 - t1;
+  // Сколько пикселей ушло в дисплей именно в этом вызове LVGL. Если самый
+  // долгий вызов рисует много — упираемся в отрисовку; если мало — тормоз
+  // не в графике вообще.
+  static uint32_t px_before = 0;
+  uint32_t px_now = g_flush_px;
+  uint32_t dpx = px_now - px_before;
+  px_before = px_now;
+  prof_loops++;
+  prof_lv_total += dlv;
+  prof_kl_total += dkl;
+  static uint32_t prof_lv_max_px = 0;
+  if (dlv > prof_lv_max) { prof_lv_max = dlv; prof_lv_max_px = dpx; }
+  if (dkl > prof_kl_max) prof_kl_max = dkl;
+
+  if (!prof_started) {
+    prof_started = true;
+    prof_last_ms = now;
   }
+  if (now - prof_last_ms >= 5000) {
+    uint32_t span = now - prof_last_ms;
+    prof_last_ms = now;
+    if (prof_loops) {
+      Serial.printf("[PERF] циклов=%lu (%lu/с)  LVGL сред=%luмкс макс=%luмкс  "
+                    "K-Line сред=%luмкс макс=%luмкс  "
+                    "вывод: %lu кусков, %lu тыс.пикс, %lu мс  "
+                    "в худшем вызове %lu пикс\n",
+                    (unsigned long)prof_loops,
+                    (unsigned long)(prof_loops * 1000UL / (span ? span : 1)),
+                    (unsigned long)(prof_lv_total / prof_loops),
+                    (unsigned long)prof_lv_max,
+                    (unsigned long)(prof_kl_total / prof_loops),
+                    (unsigned long)prof_kl_max,
+                    (unsigned long)g_flush_calls,
+                    (unsigned long)(g_flush_px / 1000),
+                    (unsigned long)(g_flush_us / 1000),
+                    (unsigned long)prof_lv_max_px);
+    }
+    prof_loops = 0;
+    prof_lv_total = prof_lv_max = 0;
+    prof_lv_max_px = 0;
+    prof_kl_total = prof_kl_max = 0;
+    g_flush_calls = 0;
+    g_flush_px = 0;
+    g_flush_us = 0;
+  }
+#else
+  lv_timer_handler();
+  kline_test_poll(now);
+#endif
 }
