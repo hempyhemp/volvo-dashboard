@@ -188,7 +188,7 @@ static void update_timer_cb(lv_timer_t *timer) {
   if (kd.connected) {
     apply_new_value(&params[P_RPM], kd.rpm);
     apply_new_value(&params[P_COOLANT], kd.coolant_c);
-    apply_new_value(&params[P_IGN], kd.ign_deg);
+    apply_new_value(&params[P_IGN], kd.ign_deg_x10);
     // BOOST — МАНОМЕТРИЧЕСКОЕ давление (относительно атмосферы) из абс. MAP.
     // MAP считает kline_test.cpp из байта F9A0 по калибровке ДАД прошивки
     // (12.5 + 241·F9A0/255 кПа), опора baro — тот же ДАД на заглушенном
@@ -340,7 +340,8 @@ void screen_online_create(lv_obj_t *parent) {
   params[P_VOLT] = (param_t){KIND_LABEL, NULL, NULL, 138, 110, 148, 2, "V", true};
   params[P_OIL_P] = (param_t){KIND_LABEL, NULL, NULL, 28, 5, 60, 3, "bar", true};
   params[P_POWER] = (param_t){KIND_LABEL, NULL, NULL, 0, 0, 400, 5, "", false};
-  params[P_IGN] = (param_t){KIND_LABEL, NULL, NULL, 12, -5, 35, 3, "deg", false};
+  // УОЗ хранится ×10 (шаг у ЭБУ — полградуса), поэтому scale10 = true.
+  params[P_IGN] = (param_t){KIND_LABEL, NULL, NULL, 120, -50, 400, 5, "deg", true};
 
   // --- Главный параметр: BOOST, дуга по центру ---
   make_arc(&params[P_BOOST], parent, 100, 4, 120, lv_color_hex(0x4CA6FF), 10,

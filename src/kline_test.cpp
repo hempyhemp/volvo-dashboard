@@ -382,7 +382,48 @@ static inline int32_t kline_map_from_adc(uint8_t adc) {
 // Точка обогащения — ЗАМЕРЕНА у ИОН 2026-09-19: на наддуве 187.37 кПа
 // ИОН показывал состав смеси 11.94 при целевых 14.7 (на ХХ было 14.01).
 // Раньше здесь стояли угаданные 12.0 при 200 кПа — почти угадали.
-#define KLINE_AFR_STOICH  (FWCAL_AFR_STOICH_X100 / 100.0f) // из firmware_cal.ini
+// РАБОЧИЙ состав смеси — база для расчёта РАСХОДА. Приезжает из
+// firmware_cal.ini, там же и объяснение, почему 12.5, а не 14.7.
+#define KLINE_AFR_WORK  (FWCAL_AFR_STOICH_X100 / 100.0f)
+// ИСТИННАЯ стехиометрия бензина. Это ХИМИЯ, а не калибровка ЭБУ, и она
+// НЕ должна ехать вслед за рабочим составом. Используется ТОЛЬКО в расчёте
+// мощности: мощность даёт сгоревшее топливо, а сколько его сгорит —
+// определяет кислород. Если подставить сюда богатую смесь, мотору
+// припишется лишних ~18% мощности из бензина, который не сгорел.
+#define KLINE_AFR_CHEM  14.7f
+
+// --- СОСТАВ СМЕСИ ПО НАСТОЯЩЕЙ КАРТЕ ИЗ ПРОШИВКИ (2026-09-19) ---
+// Раскрыто дизассемблированием (docs/KLINE.md, «КАК ЭБУ ВЫБИРАЕТ СМЕСЬ»).
+// Повторяем ровно то, что делает ЭБУ в процедуре 0x4438:
+//   строка  = (байт давления F9A0) >> 4,  доля = младший полубайт
+//   столбец = (T[байт оборотов]) >> 4,    доля = младший полубайт
+//   значение = билинейная интерполяция четырёх соседних ячеек, /256
+// Таблиц осей у карты НЕТ: ось давления равномерная по байту F9A0, а
+// обороты проходят через таблицу пересчёта T, которую генератор читает
+// прямо из прошивки.
+#if FWCAL_AFR_MAP_OK && FWCAL_RPM_IDX_OK
+#define KLINE_AFR_FROM_MAP 1
+static const uint8_t kRpmIdx[256] = FWCAL_RPM_IDX_TABLE;
+static const int16_t kAfrMap[FWCAL_AFR_MAP_ROWS][FWCAL_AFR_MAP_COLS] =
+    FWCAL_AFR_MAP_X100;
+
+// press — байт квантованного давления (F9A0), rpm_b — байт оборотов из
+// кадра (обороты = rpm_b * 40). Возвращает состав смеси ×100.
+static int32_t kline_afr_x100_from_map(uint8_t press, uint8_t rpm_b) {
+  uint8_t ri = kRpmIdx[rpm_b];
+  uint8_t row = press >> 4, col = ri >> 4;
+  uint8_t fy = press & 0x0F, fx = ri & 0x0F;
+  uint8_t row2 = (row < FWCAL_AFR_MAP_ROWS - 1) ? row + 1 : row;
+  uint8_t col2 = (col < FWCAL_AFR_MAP_COLS - 1) ? col + 1 : col;
+  int32_t v00 = kAfrMap[row][col],  v01 = kAfrMap[row][col2];
+  int32_t v10 = kAfrMap[row2][col], v11 = kAfrMap[row2][col2];
+  int32_t acc = v00 * (16 - fx) * (16 - fy) + v01 * fx * (16 - fy) +
+                v10 * (16 - fx) * fy + v11 * fx * fy;
+  return acc / 256;
+}
+#else
+#define KLINE_AFR_FROM_MAP 0
+#endif
 #define KLINE_AFR_BOOST   11.94f // замер ИОН при KLINE_AFR_BOOST_KPA
 #define KLINE_AFR_BOOST_KPA 187.37f
 
@@ -834,7 +875,14 @@ static bool kline_parse_read_data(const uint8_t *resp, size_t n,
   out->air_temp_valid = true;
   // Цикловое наполнение (GBC) — F808 (data[45-46]), младший байт первым.
   out->gbc = (int32_t)resp[57] | ((int32_t)resp[58] << 8);
-  out->ign_deg = 0; // УОЗ в кадр 0x0F не входит; ИОН его считает из прошивки
+  // УОЗ — d20 кадра = RAM 0x62, в ПОЛОВИНАХ градуса (х2).
+  // Найдено дизассемблированием 2026-09-19: по 0x2726 результат выборки из
+  // карты УОЗ (0x7877) кладётся командой MOV 0x62,A, а RAM 0x62 стоит в
+  // дескрипторе кадра 0x0F двадцатым по счёту.
+  // Проверено по логу против ИОН: заглушен 0 во всех 1121 кадре (ИОН 0);
+  // на ХХ самое частое значение 31 -> 15.5 (ИОН 15.5); на газу 45 -> 22.5
+  // (ИОН 22.5). Совпадение точное, отсюда и «половинки» на экране ИОН.
+  out->ign_deg_x10 = (int32_t)resp[32] * 5;
   // Давление: из кадра (F80C, d26 = resp[38]) по калибровке от ИОН, либо,
   // если KLINE_MAP_FROM_FRAME=0, из кэша отдельного чтения F9A0.
 #if KLINE_MAP_FROM_FRAME
@@ -861,21 +909,35 @@ static bool kline_parse_read_data(const uint8_t *resp, size_t n,
   out->fuel_lph_x10 = 0;
   if (out->rpm > 0 && out->gbc > 0) {
     float air_kgh = (float)out->gbc / KLINE_GBC_PER_KGH;
-    float afr = KLINE_AFR_STOICH;
+    float afr = KLINE_AFR_WORK;
+#if KLINE_AFR_FROM_MAP
+    // Настоящая карта из прошивки — точнее любой прямой по двум точкам.
+    // Байт давления F9A0 отдельным запросом не читаем, берём из кадра:
+    // F80C идёт параллельно F9A0 со смещением, замеренным на машине.
+    {
+      int32_t pb = (int32_t)resp[38] - FWCAL_MAP_PRESS_BYTE_OFFSET;
+      if (pb < 0) pb = 0;
+      if (pb > 255) pb = 255;
+      out->afr_x100 = kline_afr_x100_from_map((uint8_t)pb, resp[24]);
+      afr = out->afr_x100 / 100.0f;
+    }
+#else
     if (g_map_valid) {
       float map_kpa = g_map_x100 / 100.0f;
       float baro_kpa = g_baro_x100 / 100.0f;
       if (map_kpa > baro_kpa) {
         float k = (map_kpa - baro_kpa) / (KLINE_AFR_BOOST_KPA - baro_kpa);
         if (k > 1.0f) k = 1.0f;
-        afr = KLINE_AFR_STOICH - k * (KLINE_AFR_STOICH - KLINE_AFR_BOOST);
+        afr = KLINE_AFR_WORK - k * (KLINE_AFR_WORK - KLINE_AFR_BOOST);
       }
     }
+    out->afr_x100 = (int32_t)(afr * 100.0f + 0.5f);
+#endif
     float lph = air_kgh / afr / KLINE_FUEL_RHO;
     out->fuel_lph_x10 = (int32_t)(lph * 10.0f + 0.5f);
 
     // Мощность — по воздуху и стехиометрии (см. комментарий к константам).
-    float hp = air_kgh / 3600.0f / KLINE_AFR_STOICH *
+    float hp = air_kgh / 3600.0f / KLINE_AFR_CHEM *
                (KLINE_FUEL_LHV_MJ * 1000000.0f) * KLINE_ENGINE_EFF /
                KLINE_WATT_PER_HP;
     out->power_hp = (int32_t)(hp + 0.5f);
@@ -1473,16 +1535,18 @@ void kline_test_poll(uint32_t now_ms) {
         last_tune = now_ms;
         int v100 = (int)(kd.voltage * 100 + 0.5f);
         Serial.printf(
-            "[TUNE] RPM=%ld дрос=%ld%%(r%u) ОЖ=%ldC(r%u) V=%d.%02d "
+            "[TUNE] RPM=%ld дрос=%ld%%(r%u) ОЖ=%ldC(r%u) V=%d.%02d УОЗ=%ld.%ld "
             "MAP=%ld.%02ld кПа возд=%ldC GBC=%ld расход=%ld.%ld л/ч "
-            "воздух=%ld.%ld кг/ч мощн=%ld л.с. "
+            "воздух=%ld.%ld кг/ч мощн=%ld л.с. смесь=%ld.%02ld "
             "баро=%ld.%02ld буст=%s%ld.%02ld бар\n",
             (long)kd.rpm, (long)kd.throttle_pct, g_buf[23], (long)kd.coolant_c,
-            g_buf[20], v100 / 100, v100 % 100, (long)(kd.map_kpa_x100 / 100),
+            g_buf[20], v100 / 100, v100 % 100,
+            (long)(kd.ign_deg_x10 / 10), (long)(kd.ign_deg_x10 % 10), (long)(kd.map_kpa_x100 / 100),
             (long)(kd.map_kpa_x100 % 100), (long)kd.air_temp_c, (long)kd.gbc,
             (long)(kd.fuel_lph_x10 / 10), (long)(kd.fuel_lph_x10 % 10),
             (long)(kd.air_kgh_x10 / 10), (long)(kd.air_kgh_x10 % 10),
             (long)kd.power_hp,
+            (long)(kd.afr_x100 / 100), (long)(kd.afr_x100 % 100),
             (long)(kd.baro_kpa_x100 / 100), (long)(kd.baro_kpa_x100 % 100),
             ((kd.map_kpa_x100 < kd.baro_kpa_x100) ? "-" : ""),
             (long)(labs(kd.map_kpa_x100 - kd.baro_kpa_x100) / 10000),

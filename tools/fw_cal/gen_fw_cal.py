@@ -297,7 +297,26 @@ def generate():
         return vals if len(vals) == n else None
 
     rpm_axis = axis("rpm_axis", len(grid[0])) if grid else None
-    kpa_axis = axis("kpa_axis", len(grid)) if grid else None
+
+    # Таблица пересчёта оборотов в индекс карт — ПРЯМО ИЗ ПРОШИВКИ.
+    # Найдена дизассемблированием: код по 0xC24D делает
+    #   MOV DPTR,#0x613C / MOV A,RAM55 / MOVC A,@A+DPTR / MOV RAM57,A
+    # то есть индекс = T[байт_оборотов]. Старший полубайт индекса выбирает
+    # столбец карты, младший — доля для интерполяции.
+    rpm_tab = None
+    rt = gets(cfg, "afr_map", "rpm_table_offset", "")
+    if rt and found:
+        try:
+            rt = int(rt, 0)
+            with open(fw_path, "rb") as f:
+                blob2 = f.read()
+            t = blob2[rt:rt + 256]
+            # Проверка на вменяемость: таблица обязана быть неубывающей.
+            if len(t) == 256 and all(t[i] <= t[i + 1] for i in range(255)):
+                rpm_tab = list(t)
+        except (ValueError, OSError):
+            rpm_tab = None
+    press_off = geti(cfg, "afr_map", "press_byte_offset", 10)
 
     a("")
     a("// --- КАРТА СОСТАВА СМЕСИ, прочитана ИЗ САМОЙ ПРОШИВКИ ---")
@@ -321,15 +340,20 @@ def generate():
               % ", ".join("%d" % round(v) for v in rpm_axis))
         else:
             a('#define FWCAL_AFR_MAP_RPM_OK 0')
-        if kpa_axis:
-            a('#define FWCAL_AFR_MAP_KPA_OK 1')
-            a('// Ось давления, кПа x100')
-            a('#define FWCAL_AFR_MAP_KPA_X100 { %s }'
-              % ", ".join("%d" % round(v * 100) for v in kpa_axis))
+        # Ось давления хранить не надо: строка = F9A0 >> 4 (см. дизасм).
+        a('// Строка карты = (байт давления F9A0) >> 4 — ось равномерная,')
+        a('// таблицы точек разбивки у неё нет (проверено дизассемблированием).')
+        a('#define FWCAL_MAP_PRESS_BYTE_OFFSET %d  // F9A0 = F80C - это' % press_off)
+        if rpm_tab:
+            a('// Столбец карты = (T[байт оборотов]) >> 4, T — из прошивки.')
+            a('#define FWCAL_RPM_IDX_OK 1')
+            a('#define FWCAL_RPM_IDX_TABLE { ' + BS2)
+            for i in range(0, 256, 16):
+                tail = "" if i == 240 else ","
+                a('  %s%s ' % (", ".join("%d" % v for v in rpm_tab[i:i + 16]), tail) + BS2)
+            a('}')
         else:
-            a('// Ось давления НЕ ЗАДАНА -> карту индексировать нечем,')
-            a('// расход считается прежней прямой по двум точкам.')
-            a('#define FWCAL_AFR_MAP_KPA_OK 0')
+            a('#define FWCAL_RPM_IDX_OK 0')
     else:
         a("// Карта не прочитана: %s" % map_note)
         a('#define FWCAL_AFR_MAP_OK   0')
@@ -348,8 +372,8 @@ def generate():
         with open(OUT, "w", encoding="utf-8") as f:
             f.write(text)
 
-    print("[fw_cal] оси карты: обороты=%s, давление=%s"
-          % ("есть" if rpm_axis else "НЕТ", "есть" if kpa_axis else "НЕТ"))
+    print("[fw_cal] индексация карты: таблица оборотов=%s, ось давления=равномерная"
+          % ("прочитана из прошивки" if rpm_tab else "НЕТ"))
     print("[fw_cal] карта состава смеси: %s"
           % ("%dx%d, AFR %s" % (len(grid), len(grid[0]), map_note) if grid
              else "НЕ ПРОЧИТАНА (%s)" % map_note))
