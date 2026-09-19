@@ -43,10 +43,10 @@ typedef struct {
 #define PARAM_COUNT 8
 enum { P_BOOST, P_RPM, P_AIR_T, P_COOLANT, P_VOLT, P_OIL_P, P_OIL_T, P_IGN };
 
-// Атмосферное давление (кПа) — точка отсчёта манометрического давления
-// наддува. 100 кПа даёт ~0 при включённом зажигании и заглушенном моторе.
-// Для точного нуля можно подставить реальное показание MAP в этот момент.
-#define KLINE_BARO_KPA 100
+// Атмосферное давление — точка отсчёта манометрического давления наддува.
+// БОЛЬШЕ НЕ КОНСТАНТА: kline_test.cpp запоминает реальное показание ДАД на
+// неработающем моторе (RPM=0) и кладёт его в kd.baro_kpa_x100, поэтому на
+// заглушенной машине буст ровно 0.00 бар на любой высоте и погоде.
 
 static param_t params[PARAM_COUNT];
 
@@ -138,14 +138,14 @@ static void update_timer_cb(lv_timer_t *timer) {
     apply_new_value(&params[P_COOLANT], kd.coolant_c);
     apply_new_value(&params[P_IGN], kd.ign_deg);
     // BOOST — МАНОМЕТРИЧЕСКОЕ давление (относительно атмосферы) из абс. MAP.
-    // Источник как в ИОН: сырой АЦП ДАД (F80C/F80D), пересчёт в кПа в
-    // kline_test.cpp -> kd.map_kpa_x100 (кПа×100). Сотые доли бара:
-    //   bar_x100 = map_kpa_x100/100 - KLINE_BARO_KPA
-    //   ХХ ~45 кПа  -> -55 -> "-0.55bar" (разрежение)
-    //   зажигание   ~100 ->   0 -> "0.00bar"
-    //   наддув ~150 ->  50 -> "0.50bar"
+    // MAP считает kline_test.cpp из байта F9A0 по калибровке ДАД прошивки
+    // (12.5 + 241·F9A0/255 кПа), опора baro — тот же ДАД на заглушенном
+    // моторе. Сотые доли бара = (MAP - baro) в кПа:
+    //   ХХ ~45 кПа при баро 95  -> -50 -> "-0.50bar" (разрежение)
+    //   зажигание, мотор стоит  ->   0 -> "0.00bar"
+    //   наддув ~168 кПа         ->  73 -> "0.73bar"
     if (kd.map_valid) {
-      int32_t boost_cbar = kd.map_kpa_x100 / 100 - KLINE_BARO_KPA;
+      int32_t boost_cbar = (kd.map_kpa_x100 - kd.baro_kpa_x100) / 100;
       apply_new_value(&params[P_BOOST], boost_cbar);
     } else {
       show_dash(&params[P_BOOST]);

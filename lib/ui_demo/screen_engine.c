@@ -3,22 +3,20 @@
 #include "fonts/font_cyrillic_16.h"
 #include <stdio.h>
 
-// Вкладка МОТОР — 6 плиток параметров двигателя, которых нет на ONLINE.
+// Вкладка МОТОР — плитки, которых нет на ONLINE.
 // Источники (см. docs/KLINE.md):
-//   Абс. давление (MAP)      — readData, XDATA 0xF841, кПа (подтверждено)
-//   Наполнение (GBC)         — readData, XDATA 0xF808, сырое 16-бит
-//   Темп. заряда             — SID 0x23, XDATA 0xF99E, °C
-//   Поправка ЦН              — SID 0x23, XDATA 0xF942, сырой байт
-//   Коррекция по ОЖ          — SID 0x23, XDATA 0xF99C, сырой байт
-//   Коррекция по заряду      — SID 0x23, XDATA 0xF99D, сырой байт
-// Расход л/ч/л100 в прошивке НЕ хранится (диагностики его вычисляют) —
-// внизу вкладки поясняющая строка.
+//   Абс. давление (MAP)  — SID 0x23, XDATA 0xF9A0 (один байт),
+//                          P = 12.5 + 241·F9A0/255 кПа (калибровка прошивки)
+//   Буст                 — MAP минус атмосфера, запомненная на RPM=0
+//   Расход воздуха       — кадр 0x0F, XDATA 0xF808 (GBC), десятые кг/ч
+//   Расход топлива л/ч   — РАСЧЁТ: воздух / AFR / плотность бензина.
+//                          В ЭБУ не хранится.
 
 typedef struct {
   lv_obj_t *value;
 } tile_t;
 
-static tile_t t_map, t_gbc, t_tcharge, t_corrcn, t_corroj, t_corrchg;
+static tile_t t_map, t_boost, t_lph, t_kgh, t_gbc, t_air;
 
 static tile_t make_tile(lv_obj_t *parent, lv_coord_t x, lv_coord_t y,
                         lv_coord_t w, lv_coord_t h, const char *caption) {
@@ -70,15 +68,14 @@ static void set_x100(tile_t *t, bool ok, long v_x100, const char *suffix) {
   lv_label_set_text(t->value, buf);
 }
 
-// Коррекция как отклонение от нейтрали (raw 128 = ×1.00 = 0%).
-static void set_corr_pct(tile_t *t, bool ok, long raw) {
+// Показать значение×10 как X.X с суффиксом (для расхода).
+static void set_x10(tile_t *t, bool ok, long v_x10, const char *suffix) {
   if (!ok) {
     lv_label_set_text(t->value, "--");
     return;
   }
-  long pct = (raw - 128) * 100 / 128;
   char buf[24];
-  snprintf(buf, sizeof(buf), "%+ld%%", pct);
+  snprintf(buf, sizeof(buf), "%ld.%ld%s", v_x10 / 10, v_x10 % 10, suffix);
   lv_label_set_text(t->value, buf);
 }
 
@@ -87,16 +84,19 @@ static void update_cb(lv_timer_t *timer) {
   kline_data_t kd;
   kline_data_get(&kd);
 
-  // Абс. давление (MAP) — из 0xF9A0 (SID 0x23), кПа с сотыми.
+  // Абс. давление (MAP) — 0xF9A0, кПа с сотыми.
   set_x100(&t_map, kd.connected && kd.map_valid, (long)kd.map_kpa_x100, "");
-  // GBC (наполнение) — из readData, валидно при connected.
+  // Буст — манометрическое давление в барах (MAP минус атмосфера).
+  set_x100(&t_boost, kd.connected && kd.map_valid,
+           (long)(kd.map_kpa_x100 - kd.baro_kpa_x100), "");
+  // Расход топлива л/ч (расчёт) — при работающем моторе.
+  set_x10(&t_lph, kd.connected && kd.rpm > 0, (long)kd.fuel_lph_x10, "");
+  // Расход воздуха кг/ч — GBC в десятых кг/ч.
+  set_x10(&t_kgh, kd.connected, (long)kd.air_kgh_x10, "");
+  // GBC (сырое) — оставлено для сверки с ИОН.
   set_int(&t_gbc, kd.connected, (long)kd.gbc, "");
-  // Остальное — из SID 0x23, валидно при ext_valid.
-  bool ext = kd.connected && kd.ext_valid;
-  set_int(&t_tcharge, ext, (long)kd.charge_temp_c, " C");
-  set_int(&t_corrcn, ext, (long)kd.corr_cn, "");        // поправка ЦН, raw
-  set_corr_pct(&t_corroj, ext, (long)kd.corr_coolant);  // % от нейтрали
-  set_corr_pct(&t_corrchg, ext, (long)kd.corr_charge);
+  // Темп. воздуха (ДТВ) — из кадра, даром.
+  set_int(&t_air, kd.connected && kd.air_temp_valid, (long)kd.air_temp_c, " C");
 }
 
 void screen_engine_create(lv_obj_t *parent) {
@@ -106,14 +106,14 @@ void screen_engine_create(lv_obj_t *parent) {
 
   // 2 колонки x 3 ряда плиток 150x58.
   t_map = make_tile(parent, 6, 6, 150, 58, "АБС.ДАВЛ, kPa");
-  t_gbc = make_tile(parent, 164, 6, 150, 58, "НАПОЛН. GBC");
-  t_tcharge = make_tile(parent, 6, 68, 150, 58, "T ЗАРЯДА, C");
-  t_corrcn = make_tile(parent, 164, 68, 150, 58, "ПОПРАВКА ЦН");
-  t_corroj = make_tile(parent, 6, 130, 150, 58, "КОРР. ОЖ");
-  t_corrchg = make_tile(parent, 164, 130, 150, 58, "КОРР. ЗАРЯД");
+  t_boost = make_tile(parent, 164, 6, 150, 58, "БУСТ, бар");
+  t_lph = make_tile(parent, 6, 68, 150, 58, "РАСХОД, л/ч");
+  t_kgh = make_tile(parent, 164, 68, 150, 58, "ВОЗДУХ, кг/ч");
+  t_gbc = make_tile(parent, 6, 130, 150, 58, "GBC (сырое)");
+  t_air = make_tile(parent, 164, 130, 150, 58, "T ВОЗД, C");
 
   lv_obj_t *note = lv_label_create(parent);
-  lv_label_set_text(note, "Расход л/ч в ЭБУ не хранится (нужна калибровка GBC)");
+  lv_label_set_text(note, "Расход — расчёт из воздуха ЭБУ; сверить с ИОН");
   lv_obj_set_style_text_font(note, &font_cyrillic_16, 0);
   lv_obj_set_style_text_color(note, lv_color_hex(0x6C6C77), 0);
   lv_obj_align(note, LV_ALIGN_BOTTOM_LEFT, 8, -4);
