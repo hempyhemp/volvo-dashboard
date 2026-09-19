@@ -24,3 +24,7 @@ tools/ion-sniffer/ion_sniff_*.log
 # Python кэш
 __pycache__/
 *.pyc
+
+# Генерируется при сборке из прошивки + firmware_cal.ini
+# (tools/fw_cal/gen_fw_cal.py) — в коммит не нужен.
+include/firmware_cal.h

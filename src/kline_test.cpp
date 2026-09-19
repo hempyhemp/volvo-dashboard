@@ -89,6 +89,19 @@
 #include "kline_test.h"
 #include "screen_debug.h"
 #include "kline_data.h"
+// Паспорт прошивки ЭБУ. firmware_cal.h генерируется ОТДЕЛЬНОЙ командой
+//     python tools\fw_cal\gen_fw_cal.py
+// из .bin в корне + firmware_cal.ini, в git не хранится и при обычной
+// сборке НЕ пересоздаётся (чтобы сборка не лезла в бинарник каждый раз).
+// Если его нет — берём значения по умолчанию, те же, что были захардкожены
+// до появления привязки к прошивке.
+#if defined(__has_include)
+#  if __has_include("firmware_cal.h")
+#    include "firmware_cal.h"
+#    define FWCAL_PRESENT 1
+#  endif
+#endif
+#include "firmware_cal_default.h"
 
 #define KLINE_TX_PIN 22
 #define KLINE_RX_PIN 27
@@ -310,10 +323,16 @@ static const kline_ext_read_t kMapRead = {0xF9, 0xA0, 2, 3};
 #define KLINE_MAP_FROM_FRAME 1
 #define KLINE_MAP_ADC_SLOPE_X10000 9969 // кПа на единицу F80C, ×10000
 #define KLINE_MAP_ADC_OFFSET_X100  368  // сдвиг характеристики, кПа ×100
+// Диапазон квантования ДАД (кПа×100) ТОЙ прошивки, на которой снимался
+// наклон выше. Если в прошивке в корне диапазон другой (поставили ДАД на
+// 3 бар и т.п.), наклон масштабируется пропорционально — замер не пропадает,
+// но и не «съезжает». Значение приезжает из firmware_cal.ini.
+#define KLINE_MAP_CAL_SPAN_X100 24100
+#define KLINE_MAP_SLOPE_EFF_X10000                                               ((int32_t)((int64_t)KLINE_MAP_ADC_SLOPE_X10000 * FWCAL_DAD_SPAN_KPA_X100 /                KLINE_MAP_CAL_SPAN_X100))
 
 // Пересчёт байта АЦП ДАД (F80C) в кПа×100 по калибровке от ИОН.
 static inline int32_t kline_map_from_adc(uint8_t adc) {
-  return (int32_t)(((int32_t)KLINE_MAP_ADC_SLOPE_X10000 * (int32_t)adc) / 100)
+  return (int32_t)(((int64_t)KLINE_MAP_SLOPE_EFF_X10000 * (int32_t)adc) / 100)
          + KLINE_MAP_ADC_OFFSET_X100;
 }
 // Атмосфера до первого замера на заглушенном моторе, кПа×100. Дальше
@@ -338,7 +357,7 @@ static inline int32_t kline_map_from_adc(uint8_t adc) {
 // Точка обогащения — ЗАМЕРЕНА у ИОН 2026-09-19: на наддуве 187.37 кПа
 // ИОН показывал состав смеси 11.94 при целевых 14.7 (на ХХ было 14.01).
 // Раньше здесь стояли угаданные 12.0 при 200 кПа — почти угадали.
-#define KLINE_AFR_STOICH  14.7f  // до атмосферного давления
+#define KLINE_AFR_STOICH  (FWCAL_AFR_STOICH_X100 / 100.0f) // из firmware_cal.ini
 #define KLINE_AFR_BOOST   11.94f // замер ИОН при KLINE_AFR_BOOST_KPA
 #define KLINE_AFR_BOOST_KPA 187.37f
 
@@ -1610,7 +1629,33 @@ void kline_test_poll(uint32_t now_ms) {
   }
 }
 
+// Паспорт прошивки ЭБУ, под которую собран дашборд. Печатается один раз
+// при старте, чтобы по логу всегда было видно, на каких калибровках он
+// работает, и чтобы «съехавшая» прошивка не прошла молча.
+static void kline_print_firmware_cal(void) {
+  Serial.printf("[FW] прошивка ЭБУ: %s %s  ЭБУ %s  деталь %s",
+                FWCAL_NAME, FWCAL_DATE, FWCAL_ECU_NO, FWCAL_PART_NO);
+  Serial.printf("  цил=%d (%d см3)  ДЗ %s  sha %s\n",
+                FWCAL_CYLINDERS, FWCAL_DISP_CM3, FWCAL_MARK,
+                FWCAL_SHA256_SHORT);
+  Serial.printf("[FW] ДАД: мин %d.%02d кПа, диапазон %d.%02d кПа -> "
+                "наклон давления %d.%04d кПа/ед\n",
+                FWCAL_DAD_MIN_KPA_X100 / 100, FWCAL_DAD_MIN_KPA_X100 % 100,
+                FWCAL_DAD_SPAN_KPA_X100 / 100, FWCAL_DAD_SPAN_KPA_X100 % 100,
+                (int)(KLINE_MAP_SLOPE_EFF_X10000 / 10000),
+                (int)(KLINE_MAP_SLOPE_EFF_X10000 % 10000));
+#if !FWCAL_PRESENT
+  Serial.println("[FW] паспорт прошивки не генерировали — значения по умолчанию.");
+  Serial.println("[FW] Сверить с прошивкой: python tools/fw_cal/gen_fw_cal.py");
+#elif !FWCAL_MATCHES_DECLARED
+  Serial.println("[FW] !!! ВНИМАНИЕ: прошивка в корне НЕ та, под которую сняты");
+  Serial.println("[FW] !!! калибровки (или sha256 не записана в firmware_cal.ini).");
+  Serial.println("[FW] !!! Давление и расход могли поехать — перепроверь ini.");
+#endif
+}
+
 void kline_test_register(void) {
+  kline_print_firmware_cal();
   kline_set_baud(KLINE_BAUD);
   screen_debug_set_kline_test_cb(kline_manual_test);
   screen_debug_set_timing_cb(kline_timing_get, kline_timing_adjust);
