@@ -370,7 +370,7 @@ void screen_online_create(lv_obj_t *parent) {
                    0, 2);
 
   // --- Третьестепенные: просто числа, в ряд внизу ---
-  const char *tertiary_names[] = {"WATER", "VOLT", "OIL P", "POWER hp", "IGN"};
+  const char *tertiary_names[] = {"WATER", "VOLT", "OIL P", "hp", "IGN"};
   int tertiary_idx[] = {P_COOLANT, P_VOLT, P_OIL_P, P_POWER, P_IGN};
   lv_coord_t col_w = 64;
   for (int i = 0; i < 5; i++) {

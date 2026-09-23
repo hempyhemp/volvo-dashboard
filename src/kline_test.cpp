@@ -89,6 +89,7 @@
 #include "kline_test.h"
 #include "screen_debug.h"
 #include "kline_data.h"
+#include "sd_logger.h"
 // Паспорт прошивки ЭБУ. firmware_cal.h генерируется ОТДЕЛЬНОЙ командой
 //     python tools\fw_cal\gen_fw_cal.py
 // из .bin в корне + firmware_cal.ini, в git не хранится и при обычной
@@ -1528,6 +1529,11 @@ void kline_test_poll(uint32_t now_ms) {
     if (kline_parse_read_data(g_buf, g_buf_n, &kd)) {
       g_poll_miss = 0;
       kline_data_set(&kd);
+      // Логгер на карту. Если он не поднят — это одна проверка флага и
+      // возврат, поэтому строку можно звать безусловно. Даже когда поднят,
+      // здесь только форматирование строки и отправка в очередь БЕЗ
+      // ожидания: сама карта живёт на другом ядре (см. sd_logger.cpp).
+      sd_logger_write(&kd, now_ms);
       // Компактный лог для подгонки ~раз в секунду — все живые величины
       // в одну строку, удобно сверять с ИОН (raw = сырой байт readData).
       static uint32_t last_tune = 0;

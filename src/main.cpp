@@ -19,6 +19,7 @@
 #include <esp_heap_caps.h>
 #include "ui_demo.h"
 #include "kline_test.h"
+#include "sd_logger.h"
 
 TFT_eSPI tft = TFT_eSPI();
 
@@ -221,6 +222,13 @@ void setup() {
   // Serial.println(tft.width());
   // Serial.print("  tft.height() = ");
   // Serial.println(tft.height());
+
+  // Проверка слота microSD — ДО инициализации тача, пока HSPI свободен.
+  // Разовая: выясняет, отвечает ли карта на штатных пинах платы, и сразу
+  // отдаёт шину тачу. Постоянно занять HSPI под карту нельзя, пока не
+  // решён вопрос с разводкой — см. sd_logger.cpp, блок «ПРО ШИНУ».
+  sd_logger_probe();
+  sd_logger_probe_release();
 
   setupTouch();
   // Serial.println("TOUCH INITIALIZED");

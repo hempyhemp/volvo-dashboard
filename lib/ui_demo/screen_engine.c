@@ -120,11 +120,11 @@ void screen_engine_create(lv_obj_t *parent) {
   t_gbc = make_tile(parent, 6, 130, 150, 58, "GBC (сырое)");
   t_air = make_tile(parent, 164, 130, 150, 58, "T ВОЗД, C");
 
-  lv_obj_t *note = lv_label_create(parent);
-  lv_label_set_text(note, "Расход — расчёт из воздуха ЭБУ; сверить с ИОН");
-  lv_obj_set_style_text_font(note, &font_cyrillic_16, 0);
-  lv_obj_set_style_text_color(note, lv_color_hex(0x6C6C77), 0);
-  lv_obj_align(note, LV_ALIGN_BOTTOM_LEFT, 8, -4);
+  // lv_obj_t *note = lv_label_create(parent);
+  // lv_label_set_text(note, "Расход — расчёт из воздуха ЭБУ; сверить с ИОН");
+  // lv_obj_set_style_text_font(note, &font_cyrillic_16, 0);
+  // lv_obj_set_style_text_color(note, lv_color_hex(0x6C6C77), 0);
+  // lv_obj_align(note, LV_ALIGN_BOTTOM_LEFT, 8, -4);
 
   lv_timer_create(update_cb, 250, NULL);
 }
